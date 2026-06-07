@@ -130,7 +130,13 @@ function estimateRawPartTokens(part: RawPart): number {
 }
 
 function buildSinglePartPrompt(part: RawPart): string {
+    const instruction = part.type === "tool"
+        ? "Summarize this command execution. Preserve: exact command, key results (file paths, line counts, matches), errors, and status. Drop verbose logs and repeated lines."
+        : "Summarize this assistant message. Preserve: key decisions, file paths, user constraints addressed, and code references. Drop verbose explanations and examples."
+
     return [
+        instruction,
+        "",
         "=== CONTENT ===",
         formatRawPart(part),
         "=== END ===",
