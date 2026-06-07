@@ -92,12 +92,8 @@ function isGlobTool(part: RawPart): boolean {
     return part.type === "tool" && part.tool === "glob"
 }
 
-function isEditTool(part: RawPart): boolean {
-    return part.type === "tool" && part.tool === "edit"
-}
-
 function isDirectReplaceTool(part: RawPart): boolean {
-    return isReadTool(part) || isGlobTool(part) || isEditTool(part)
+    return isReadTool(part) || isGlobTool(part)
 }
 
 function extractReadFilePath(input: unknown): string {
@@ -341,19 +337,16 @@ async function doCompression(
             const msgID = partToMessage.get(rawPart.partID)
             if (!msgID) continue
 
-            // Read/glob/edit tools → direct replacement (no LLM call)
+            // Read/glob tools → direct replacement (no LLM call)
             if (isDirectReplaceTool(rawPart)) {
                 let label: string
                 let text: string
                 if (isReadTool(rawPart)) {
                     label = "read"
                     text = extractReadFilePath(rawPart.input)
-                } else if (isGlobTool(rawPart)) {
+                } else {
                     label = "glob"
                     text = extractGlobPattern(rawPart.input)
-                } else {
-                    label = "edit"
-                    text = extractReadFilePath(rawPart.input)
                 }
                 await clientPATCH(cl, directory,
                     `/session/${sessionID}/message/${msgID}/part/${rawPart.partID}`,
@@ -464,14 +457,14 @@ function collectPartsFromMessages(
             // Whitelist: only these part types enter the compression pipeline.
             // Everything else (user messages, reasoning, synthetic, error tools, etc.) is left as-is.
             const partTool = part.tool as string | undefined
-            const isDirectReplace = part.type === "tool" && (partTool === "read" || partTool === "glob" || partTool === "edit")
+            const isDirectReplace = part.type === "tool" && (partTool === "read" || partTool === "glob")
             const isSynthetic = (part as any).synthetic === true
             const partState = (part.state as Record<string, unknown>) ?? {}
             const isError = partState.status === "error"
 
             const allow = isDirectReplace
                 || (msg.info.role === "assistant" && part.type === "text" && !isSynthetic)
-                || (msg.info.role === "assistant" && part.type === "tool" && !isError)
+                || (msg.info.role === "assistant" && part.type === "tool" && !isError && partTool !== "edit")
 
             if (!allow) continue
 

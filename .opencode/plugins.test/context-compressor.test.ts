@@ -296,19 +296,17 @@ describe("ContextCompressorPlugin", () => {
             output,
         )
 
-        // prt_short (skip) + prt_long (Compresser) + prt_read (direct) + prt_edit (direct) = 3 processed, 1 skipped
+        // prt_short (skip) + prt_long (Compresser) + prt_read (direct) + prt_edit (excluded from whitelist) = 2 processed, 1 skipped
         const patches = calls.filter((c) => c.method === "PATCH")
-        expect(patches).toHaveLength(3) // prt_long + prt_read + prt_edit
+        expect(patches).toHaveLength(2) // prt_long + prt_read (edit preserved verbatim, not patched)
 
-        expect(output.parts[0].text).toContain("processed 3 part(s)")
-        expect(output.parts[0].text).toContain("2 tools replaced directly")
+        expect(output.parts[0].text).toContain("processed 2 part(s)")
+        expect(output.parts[0].text).toContain("1 tools replaced directly")
         expect(output.parts[0].text).toContain("1 too short skipped")
 
-        // Verify edit tool was direct-replaced
+        // Verify edit tool was NOT patched (preserved verbatim for model context)
         const editPatch = patches.find((p) => (p.body as any).text?.startsWith("edit "))
-        expect(editPatch).toBeDefined()
-        expect((editPatch!.body as any).text).toBe("edit src/main.ts")
-        expect((editPatch!.body as any).metadata?.compressed).toBe(true)
+        expect(editPatch).toBeUndefined()
 
         // Verify boundary message was created with noReply
         const promptCalls = calls.filter((c) => c.method === "session.prompt")
