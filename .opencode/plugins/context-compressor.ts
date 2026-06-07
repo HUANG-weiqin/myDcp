@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 
 const COMPRESS_COMMAND = "compress-all"
+const COMPRESS_STATUS_COMMAND = "compress-status"
 const COMPRESS_AGENT = "Compresser"
 
 interface RawPart {
@@ -78,11 +79,65 @@ async function collectRawParts(
 }
 
 // ---------------------------------------------------------------------------
+// Tool output compression (large shell/bash/etc outputs)
+// ---------------------------------------------------------------------------
+
+/** Check if a tool part needs output compression (large output, not whitelisted). */
+function shouldCompressToolOutput(part: Record<string, unknown>): boolean {
+    if (part.type !== "tool") return false
+    const tool = part.tool as string
+    if (SKIP_OUTPUT_COMPRESS_TOOLS.has(tool)) return false
+    // Skip if already compressed by this pipeline
+    if ((part.metadata as Record<string, unknown>)?.toolOutputCompressed === true) return false
+
+    const output = getToolOutputText(part)
+    return typeof output === "string" && output.length >= TOOL_OUTPUT_MIN_CHARS
+}
+
+/** Extract tool output text from a tool part (handles both flat and state-wrapped formats). */
+function getToolOutputText(part: Record<string, unknown>): string | null {
+    if (typeof (part as any).output === "string") return (part as any).output
+    const state = part.state as Record<string, unknown> | undefined
+    if (state && typeof state.output === "string") return state.output
+    return null
+}
+
+/** Replace tool output text on a part (handles both formats, in-place). */
+function setToolOutputText(part: Record<string, unknown>, text: string): void {
+    if (typeof (part as any).output === "string") {
+        ;(part as any).output = text
+    }
+    const state = part.state as Record<string, unknown> | undefined
+    if (state && typeof state.output === "string") {
+        state.output = text
+    }
+}
+
+function buildToolOutputPrompt(outputText: string, toolName: string): string {
+    return [
+        `Summarize the output of the "${toolName}" command execution.`,
+        "Extract ONLY: what was done, key results (paths, counts, matches, data), errors, and status.",
+        "Drop: verbose logs, repeated boilerplate, progress indicators, and noise.",
+        `Output length: ${outputText.length} chars. Target: <10% of original.`,
+        "",
+        "=== COMMAND OUTPUT ===",
+        outputText.substring(0, 80000), // safety cap
+        "=== END ===",
+    ].join("\n")
+}
+
+// ---------------------------------------------------------------------------
 // High-fidelity per-part compression
 // ---------------------------------------------------------------------------
 
 /** Parts below this many tokens are left as-is (Compresser call overhead exceeds savings). */
 const MIN_COMPRESS_TOKENS = 200
+
+/** Tools that should NOT have their outputs compressed (always kept as-is). */
+const SKIP_OUTPUT_COMPRESS_TOOLS = new Set(["read", "glob", "edit", "skill", "grep"])
+
+/** Minimum raw text length for a tool output to trigger content-aware compression (~2000 tokens). */
+const TOOL_OUTPUT_MIN_CHARS = 8000
 
 function isReadTool(part: RawPart): boolean {
     return part.type === "tool" && part.tool === "read"
@@ -191,8 +246,8 @@ interface CompressorPluginConfig {
 
 /** Safe defaults used when no model context info is available. */
 const FALLBACK_DEFAULTS = {
-    agentContextWindow: 64000,
-    compressTriggerMultiple: 2.0,
+    agentContextWindow: 20000,
+    compressTriggerMultiple: 3.0,
 } as const
 
 /** Apply a compression event no sooner than this many messages after the last one. */
@@ -526,6 +581,40 @@ function collectPartsFromMessages(
 }
 
 // ---------------------------------------------------------------------------
+// Tool output compression — compress large shell/bash/etc outputs in-place
+// ---------------------------------------------------------------------------
+
+/** Compress a large tool output via Compresser, returning the summary. */
+async function compressToolOutputText(
+    ctx: { client: any },
+    directory: string,
+    outputText: string,
+    toolName: string,
+): Promise<string> {
+    const created = responseData(
+        await ctx.client.session.create({
+            body: { title: `Tool output compressor scratch` },
+            query: { directory },
+        }),
+    )
+    const tempSessionID = created.id
+    try {
+        return responseText(
+            await ctx.client.session.prompt({
+                path: { id: tempSessionID },
+                body: {
+                    agent: COMPRESS_AGENT,
+                    parts: [{ type: "text", text: buildToolOutputPrompt(outputText, toolName) }],
+                },
+                query: { directory },
+            }),
+        ).trim()
+    } finally {
+        try { await ctx.client.session.delete({ path: { id: tempSessionID } }) } catch { /* ignore */ }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin entry point
 // ---------------------------------------------------------------------------
 
@@ -538,7 +627,7 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
     let detectedContextWindow = 0
     let configLogged = false
 
-    /** Resolve effective config: user override → model-based → fallback. */
+    /** Resolve effective config: user override → fallback defaults (hardcoded). */
     function resolveConfig(): { window: number; multiple: number } {
         const hasWindow = userConfig.agentContextWindow != null
         const hasMultiple = userConfig.compressTriggerMultiple != null
@@ -550,14 +639,9 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
             }
         }
 
-        if (detectedContextWindow > 0) {
-            const optimal = calculateOptimalDefaults(detectedContextWindow)
-            return {
-                window: Math.max(optimal.agentContextWindow, 1024),
-                multiple: Math.max(optimal.compressTriggerMultiple, 1.5),
-            }
-        }
-
+        // Use hardcoded fallback defaults. Model-based detection is skipped because
+        // global config plugin options may not be passed to the plugin factory, and
+        // model context windows (up to 1M) produce overly conservative thresholds.
         return {
             window: Math.max(FALLBACK_DEFAULTS.agentContextWindow, 1024),
             multiple: Math.max(FALLBACK_DEFAULTS.compressTriggerMultiple, 1.5),
@@ -574,11 +658,72 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
                 template: "",
                 description: "Compressor: compress current-session raw parts with the Compresser agent",
             }
+            config.command[COMPRESS_STATUS_COMMAND] = {
+                template: "",
+                description: "Compressor: show current session compression status (tokens in/out of window)",
+            }
         },
 
         "experimental.chat.messages.transform": async (_input, output) => {
+            const sessionID: string | undefined = (_input as any).session?.id ?? (_input as any).sessionID
+            const toolOutputPatches: Array<{ path: string; body: any }> = []
+
             for (const msg of output.messages) {
-                for (const part of msg.parts) stripCompressorMetadata(part as Record<string, unknown>)
+                const msgID: string | undefined = (msg as any).id ?? (msg as any).info?.id
+
+                for (const part of (msg as any).parts as Array<Record<string, unknown>>) {
+                    // Always strip internal metadata (existing behavior)
+                    stripCompressorMetadata(part)
+
+                    // Compress large non-whitelisted tool outputs (shell, bash, etc.)
+                    if (!shouldCompressToolOutput(part)) continue
+
+                    const outputText = getToolOutputText(part)
+                    if (!outputText) continue
+
+                    const toolName = part.tool as string
+                    const summary = await compressToolOutputText(ctx, ctx.directory, outputText, toolName)
+
+                    // Replace output in the message being sent to the model
+                    setToolOutputText(part, summary)
+
+                    // Mark metadata to prevent re-compression on subsequent transforms
+                    const meta = (part.metadata as Record<string, unknown>) ?? {}
+                    meta.toolOutputCompressed = true
+                    part.metadata = meta
+
+                    // PATCH the stored part in the session database so the change persists
+                    const partID: string | undefined = part.id as string | undefined
+                    if (sessionID && msgID && partID) {
+                        const state = (part.state as Record<string, unknown>) ?? {}
+                        toolOutputPatches.push({
+                            path: `/session/${sessionID}/message/${msgID}/part/${partID}`,
+                            body: {
+                                id: partID,
+                                sessionID,
+                                messageID: msgID,
+                                type: "tool",
+                                tool: toolName,
+                                callID: part.callID,
+                                state: {
+                                    input: state.input,
+                                    output: summary,
+                                    status: state.status ?? "success",
+                                },
+                                metadata: { toolOutputCompressed: true },
+                            },
+                        })
+                        console.log(`[Compressor] Compressed ${toolName} output: ${outputText.length} → ${summary.length} chars`)
+                    }
+                }
+            }
+
+            // Flush tool output patches atomically
+            if (toolOutputPatches.length > 0) {
+                const cl = rawClient(ctx)
+                for (const p of toolOutputPatches) {
+                    await clientPATCH(cl, ctx.directory, p.path, p.body)
+                }
             }
         },
 
@@ -607,6 +752,11 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
                 await ctx.client.session
                     .messages({ path: { id: input.sessionID }, query: { directory: ctx.directory } })
                     .then((r: any) => r?.data ?? r)
+
+            if (messages.length === 0) {
+                console.log(`[Compressor] Skipping: no messages returned for session ${input.sessionID}`)
+                return
+            }
 
             // Count total raw tokens across all messages
             // Uses actual API token data for assistant messages where available
@@ -650,6 +800,53 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
         },
 
         "command.execute.before": async (input, output) => {
+            if (input.command === COMPRESS_STATUS_COMMAND) {
+                const messages: Array<{ info: { id: string; role: string }; parts: Array<Record<string, unknown>> }> =
+                    await ctx.client.session
+                        .messages({ path: { id: input.sessionID }, query: { directory: ctx.directory } })
+                        .then((r: any) => r?.data ?? r)
+
+                const c = resolveConfig()
+
+                // Total raw (uncompressed) tokens across all messages
+                let totalRawTokens = 0
+                for (const msg of messages) totalRawTokens += getMessageRawTokens(msg)
+
+                // Protected window: newest messages that fit within window
+                const protectedCount = computeProtectedCount(messages, c.window, MESSAGE_FLOOR)
+                let protectedTokens = 0
+                for (let i = messages.length - protectedCount; i < messages.length; i++) {
+                    protectedTokens += getMessageRawTokens(messages[i])
+                }
+
+                // Compressible: messages outside the protection window
+                const compressibleCount = messages.length - protectedCount
+                let compressibleTokens = 0
+                for (let i = 0; i < compressibleCount; i++) {
+                    compressibleTokens += getMessageRawTokens(messages[i])
+                }
+
+                const threshold = Math.floor(c.window * c.multiple)
+
+                const lines = [
+                    `── Compression Status ──`,
+                    `Config: window=${c.window}, multiple=${c.multiple}, threshold=${threshold}`,
+                    ``,
+                    `Total messages: ${messages.length}`,
+                    `Protected (in window):  ${protectedCount} msg, ~${protectedTokens} tokens`,
+                    `Compressible (outside): ${compressibleCount} msg, ~${compressibleTokens} tokens`,
+                    `Total raw tokens:       ~${totalRawTokens} tokens`,
+                    ``,
+                    totalRawTokens > threshold
+                        ? `Status: THRESHOLD EXCEEDED (${totalRawTokens} > ${threshold}), auto-compress pending.`
+                        : `Status: OK (${totalRawTokens} ≤ ${threshold}), waiting for more content.`,
+                ]
+
+                output.parts.length = 0
+                output.parts.push({ type: "text", text: lines.join("\n") })
+                return
+            }
+
             if (input.command !== COMPRESS_COMMAND) return
 
             const { rawParts, messages } = await collectRawParts(ctx, ctx.directory, input.sessionID)
