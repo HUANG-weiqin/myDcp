@@ -190,15 +190,37 @@ interface CompressorPluginConfig {
     compressTriggerMultiple?: number
 }
 
-const CONFIG_DEFAULTS = {
-    agentContextWindow: 80000,
-    compressTriggerMultiple: 1.5,
+/** Safe defaults used when no model context info is available. */
+const FALLBACK_DEFAULTS = {
+    agentContextWindow: 64000,
+    compressTriggerMultiple: 2.0,
 } as const
 
-const MIN_WINDOW_TOKENS = 1024
-const MIN_MULTIPLE = 1.5
-const MESSAGE_FLOOR = 5
+/** Apply a compression event no sooner than this many messages after the last one. */
 const COMPRESS_COOLDOWN = 5
+
+/** Protect at least this many most-recent messages from compression. */
+const MESSAGE_FLOOR = 5
+
+/**
+ * Calculate optimal compression parameters from the model's max context window.
+ *
+ * Formula:
+ *   safe_context    = context_window × 0.7            (30% headroom for system prompt / schemas)
+ *   agentContextWindow = safe_context × 0.5            (50% for the raw window)
+ *   compressTriggerMultiple = 2.0                      (compress when total > 2× window)
+ *
+ * After compression: ~1 window of raw content remains, ~1 window of summaries added.
+ * Total prompt ≈ window × 1.06 → comfortably fits in provider cache.
+ */
+function calculateOptimalDefaults(contextWindow: number): { agentContextWindow: number; compressTriggerMultiple: number } {
+    const safeContext = Math.floor(contextWindow * 0.7)
+    const window = Math.floor(safeContext * 0.5)
+    return {
+        agentContextWindow: Math.max(16000, Math.min(window, 128000)),
+        compressTriggerMultiple: 2.0,
+    }
+}
 
 // ===== Token estimation (rough: ~1 token per 4 chars for mixed content) =====
 
@@ -485,18 +507,39 @@ function collectPartsFromMessages(
 // ---------------------------------------------------------------------------
 
 export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
-    const pluginConfig: CompressorPluginConfig = {
-        ...CONFIG_DEFAULTS,
+    const userConfig: CompressorPluginConfig = {
         ...(options as CompressorPluginConfig | undefined),
     }
-    const windowTokens = Math.max(
-        pluginConfig.agentContextWindow ?? CONFIG_DEFAULTS.agentContextWindow,
-        MIN_WINDOW_TOKENS,
-    )
-    const triggerMultiple = Math.max(
-        pluginConfig.compressTriggerMultiple ?? CONFIG_DEFAULTS.compressTriggerMultiple,
-        MIN_MULTIPLE,
-    )
+
+    // Detected from model at runtime via chat.params hook
+    let detectedContextWindow = 0
+    let configLogged = false
+
+    /** Resolve effective config: user override → model-based → fallback. */
+    function resolveConfig(): { window: number; multiple: number } {
+        const hasWindow = userConfig.agentContextWindow != null
+        const hasMultiple = userConfig.compressTriggerMultiple != null
+
+        if (hasWindow || hasMultiple) {
+            return {
+                window: Math.max(hasWindow ? userConfig.agentContextWindow! : FALLBACK_DEFAULTS.agentContextWindow, 1024),
+                multiple: Math.max(hasMultiple ? userConfig.compressTriggerMultiple! : FALLBACK_DEFAULTS.compressTriggerMultiple, 1.5),
+            }
+        }
+
+        if (detectedContextWindow > 0) {
+            const optimal = calculateOptimalDefaults(detectedContextWindow)
+            return {
+                window: Math.max(optimal.agentContextWindow, 1024),
+                multiple: Math.max(optimal.compressTriggerMultiple, 1.5),
+            }
+        }
+
+        return {
+            window: Math.max(FALLBACK_DEFAULTS.agentContextWindow, 1024),
+            multiple: Math.max(FALLBACK_DEFAULTS.compressTriggerMultiple, 1.5),
+        }
+    }
 
     let lastCompressedMsgCount = 0
     const compressingSessions = new Set<string>()
@@ -516,11 +559,26 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
             }
         },
 
+        // Detect model context window from the LLM route
+        "chat.params": async (input) => {
+            const ctxLimit = input.model?.limit?.context
+            if (typeof ctxLimit === "number" && ctxLimit > 0 && ctxLimit !== detectedContextWindow) {
+                detectedContextWindow = ctxLimit
+                if (!configLogged) {
+                    const c = resolveConfig()
+                    console.log(`[Compressor] Detected context window ${ctxLimit}, using window=${c.window}, trigger=${c.multiple}`)
+                    configLogged = true
+                }
+            }
+        },
+
         "chat.message": async (input) => {
             if (!input.sessionID || !input.messageID) return
 
             // Concurrency guard: only one async compression per session
             if (compressingSessions.has(input.sessionID)) return
+
+            const c = resolveConfig()
 
             const messages: Array<{ info: { id: string; role: string }; parts: Array<Record<string, unknown>> }> =
                 await ctx.client.session
@@ -535,14 +593,14 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
             }
 
             // Check threshold: trigger when total > window × multiple
-            const threshold = Math.floor(windowTokens * triggerMultiple)
+            const threshold = Math.floor(c.window * c.multiple)
             if (totalRawTokens <= threshold) return
 
             // Cooldown: skip if we just compressed
             if (messages.length - lastCompressedMsgCount < COMPRESS_COOLDOWN) return
 
             // Determine how many of the most recent messages to protect
-            const protectedCount = computeProtectedCount(messages, windowTokens, MESSAGE_FLOOR)
+            const protectedCount = computeProtectedCount(messages, c.window, MESSAGE_FLOOR)
             const compressibleCount = messages.length - protectedCount
             if (compressibleCount <= 0) return
 

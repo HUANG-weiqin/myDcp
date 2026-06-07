@@ -610,4 +610,39 @@ describe("ContextCompressorPlugin", () => {
         // Wait for first compression to finish before test cleanup
         await new Promise((r) => setTimeout(r, 0))
     })
+
+    it("detects model context window via chat.params without error", async () => {
+        const hooks = await ContextCompressorPlugin(mockPluginInput())
+        await hooks["chat.params"]?.(
+            {
+                sessionID: "ses_test",
+                agent: "worker",
+                model: { id: "claude-sonnet-4", limit: { context: 200000, output: 8192 } },
+                provider: {},
+                message: { role: "user", content: "hi" },
+            } as any,
+            {} as any,
+        )
+        // Hook should not throw
+    })
+
+    it("uses fallback defaults when no config and no model context", async () => {
+        const compressMessages = [
+            {
+                info: { id: "msg", sessionID: "ses_test", role: "assistant" },
+                parts: [
+                    { id: "prt", sessionID: "ses_test", messageID: "msg", type: "text", text: "X".repeat(2000) },
+                ],
+            },
+        ]
+        const { client, calls } = mockRawClient({ messages: compressMessages })
+        const hooks = await ContextCompressorPlugin(mockPluginInput({ client }))
+        const output = { parts: [] as any[] }
+        await hooks["command.execute.before"]?.(
+            { command: "compress-all", sessionID: "ses_test", arguments: "" },
+            output,
+        )
+        const patches = calls.filter((c) => c.method === "PATCH")
+        expect(patches).toHaveLength(1)
+    })
 })
