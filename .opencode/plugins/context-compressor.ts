@@ -29,14 +29,6 @@ function dirQuery(directory: string): string {
     return `?directory=${encodeURIComponent(directory)}`
 }
 
-async function fetchMessages(ctx: { client: any; directory: string }, sessionID: string): Promise<any> {
-    const response = await ctx.client.session.messages({
-        path: { id: sessionID },
-        query: { directory: ctx.directory },
-    })
-    return response?.data ?? response
-}
-
 async function clientPATCH(
     client: any,
     directory: string,
@@ -49,13 +41,6 @@ async function clientPATCH(
         body: body,
     })
     if (result.error) throw new Error(`PATCH ${path} failed: ${JSON.stringify(result.error)}`)
-}
-
-async function clientDELETE(client: any, directory: string, path: string): Promise<void> {
-    const result = await client.delete({
-        url: path + dirQuery(directory),
-    })
-    if (result.error) throw new Error(`DELETE ${path} failed: ${JSON.stringify(result.error)}`)
 }
 
 function isAlreadyHandled(part: Record<string, unknown>): boolean {
@@ -85,7 +70,7 @@ async function collectRawParts(
 ): Promise<{ rawParts: RawPart[]; messages: Array<{ info: { id: string }; parts: Array<Record<string, unknown>> }> }> {
     const messages: Array<{ info: { id: string; role: string }; parts: Array<Record<string, unknown>> }> = await rc.client.session
         .messages({ path: { id: sessionID }, query: { directory } })
-        .then((r: any) => r?.data ?? r)
+        .then(responseData)
 
     const rawParts = collectPartsFromMessages(messages, maxMessages)
 
@@ -334,9 +319,20 @@ async function doCompression(
             const msgID = partToMessage.get(rawPart.partID)
             if (!msgID) continue
 
-            // Read/glob tools → direct replacement (no LLM call)
-            if (isReadTool(rawPart)) {
-                const path = extractReadFilePath(rawPart.input)
+            // Read/glob/edit tools → direct replacement (no LLM call)
+            if (isDirectReplaceTool(rawPart)) {
+                let label: string
+                let text: string
+                if (isReadTool(rawPart)) {
+                    label = "read"
+                    text = extractReadFilePath(rawPart.input)
+                } else if (isGlobTool(rawPart)) {
+                    label = "glob"
+                    text = extractGlobPattern(rawPart.input)
+                } else {
+                    label = "edit"
+                    text = extractReadFilePath(rawPart.input)
+                }
                 await clientPATCH(cl, directory,
                     `/session/${sessionID}/message/${msgID}/part/${rawPart.partID}`,
                     {
@@ -344,49 +340,7 @@ async function doCompression(
                         sessionID,
                         messageID: msgID,
                         type: "text",
-                        text: `read ${path}`,
-                        synthetic: false,
-                        ignored: false,
-                        metadata: { compressed: true },
-                    },
-                )
-                directReplacedCount++
-                compressedCount++
-                continue
-            }
-
-            // Glob tool → direct replacement (no LLM call)
-            if (isGlobTool(rawPart)) {
-                const pattern = extractGlobPattern(rawPart.input)
-                await clientPATCH(cl, directory,
-                    `/session/${sessionID}/message/${msgID}/part/${rawPart.partID}`,
-                    {
-                        id: rawPart.partID,
-                        sessionID,
-                        messageID: msgID,
-                        type: "text",
-                        text: `glob ${pattern}`,
-                        synthetic: false,
-                        ignored: false,
-                        metadata: { compressed: true },
-                    },
-                )
-                directReplacedCount++
-                compressedCount++
-                continue
-            }
-
-            // Edit tool → direct replacement (action tool, compressing it is meaningless)
-            if (isEditTool(rawPart)) {
-                const path = extractReadFilePath(rawPart.input)
-                await clientPATCH(cl, directory,
-                    `/session/${sessionID}/message/${msgID}/part/${rawPart.partID}`,
-                    {
-                        id: rawPart.partID,
-                        sessionID,
-                        messageID: msgID,
-                        type: "text",
-                        text: `edit ${path}`,
+                        text: `${label} ${text}`,
                         synthetic: false,
                         ignored: false,
                         metadata: { compressed: true },
