@@ -260,8 +260,8 @@ interface MvpPluginConfig {
 }
 
 const CONFIG_DEFAULTS = {
-    agentContextWindow: 8192,
-    compressTriggerMultiple: 2.0,
+    agentContextWindow: 100000,
+    compressTriggerMultiple: 1.5,
 } as const
 
 const MIN_WINDOW_TOKENS = 1024

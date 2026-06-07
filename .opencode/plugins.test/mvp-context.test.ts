@@ -381,7 +381,11 @@ describe("MvpContextPlugin", () => {
 
         const { client, calls } = mockRawClient({ messages: MANY_MESSAGES })
 
-        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
+        // Use small window + multiple so 12 msgs × 1750 tok = 21000 > 8192 × 2 = 16384
+        const hooks = await MvpContextPlugin(
+            mockPluginInput({ client }),
+            { agentContextWindow: 8192, compressTriggerMultiple: 2.0 } as any,
+        )
 
         // Hook fires async — compression runs in background
         await hooks["chat.message"]?.(
@@ -420,7 +424,11 @@ describe("MvpContextPlugin", () => {
 
         const { client, calls } = mockRawClient({ messages: MANY_MESSAGES })
 
-        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
+        // Use small window + multiple so compression fires and tests concurrency lock
+        const hooks = await MvpContextPlugin(
+            mockPluginInput({ client }),
+            { agentContextWindow: 8192, compressTriggerMultiple: 2.0 } as any,
+        )
 
         // First call fires compression (async)
         await hooks["chat.message"]?.(
