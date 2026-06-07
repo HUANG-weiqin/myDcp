@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
-import { MvpContextPlugin } from "../plugins/mvp-context"
-import * as MvpContextModule from "../plugins/mvp-context"
+import { ContextCompressorPlugin } from "../plugins/context-compressor"
+import * as ContextCompressorModule from "../plugins/context-compressor"
 
 /** Build a minimal plugin input, partially typed so tests compile. */
 function mockPluginInput(overrides?: Record<string, unknown>) {
@@ -117,41 +117,41 @@ const SAMPLE_MESSAGES = [
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("MvpContextPlugin", () => {
+describe("ContextCompressorPlugin", () => {
     it("does not import bun-only modules because OpenCode plugin loader rejects bun: URLs", () => {
         expect(
-            readFileSync(join(import.meta.dir, "..", "plugins", "mvp-context.ts"), "utf8"),
+            readFileSync(join(import.meta.dir, "..", "plugins", "context-compressor.ts"), "utf8"),
         ).not.toContain("bun:sqlite")
     })
 
     it("exports only plugin entrypoints so OpenCode legacy loader accepts the module", () => {
-        expect(Object.keys(MvpContextModule)).toEqual(["MvpContextPlugin"])
+        expect(Object.keys(ContextCompressorModule)).toEqual(["ContextCompressorPlugin"])
     })
 
-    it("registers the MVP context commands", async () => {
-        const hooks = await MvpContextPlugin(mockPluginInput())
+    it("registers the compressor commands", async () => {
+        const hooks = await ContextCompressorPlugin(mockPluginInput())
         const config: any = {}
 
         await hooks.config?.(config)
 
-        expect(config.command?.["mvp-prune-tools"]).toEqual({
+        expect(config.command?.["compress-prune"]).toEqual({
             template: "",
-            description: "MVP: destructively replace current-session tool parts with text",
+            description: "Compressor: destructively replace current-session tool parts with text",
         })
-        expect(config.command?.["mvp-compress-all"]).toEqual({
+        expect(config.command?.["compress-all"]).toEqual({
             template: "",
-            description: "MVP: compress current-session raw parts with the Compresser agent",
+            description: "Compressor: compress current-session raw parts with the Compresser agent",
         })
     })
 
-    it("responds when mvp-prune-tools is invoked", async () => {
+    it("responds when compress-prune is invoked", async () => {
         const { client, calls } = mockRawClient({ messages: SAMPLE_MESSAGES })
 
-        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
+        const hooks = await ContextCompressorPlugin(mockPluginInput({ client }))
         const output = { parts: [] as any[] }
 
         await hooks["command.execute.before"]?.(
-            { command: "mvp-prune-tools", sessionID: "ses_test", arguments: "" },
+            { command: "compress-prune", sessionID: "ses_test", arguments: "" },
             output,
         )
 
@@ -165,7 +165,7 @@ describe("MvpContextPlugin", () => {
     })
 
     it("ignores unrelated commands", async () => {
-        const hooks = await MvpContextPlugin(mockPluginInput())
+        const hooks = await ContextCompressorPlugin(mockPluginInput())
         const output = { parts: [{ type: "text", text: "unchanged" }] }
 
         await hooks["command.execute.before"]?.(
@@ -179,9 +179,9 @@ describe("MvpContextPlugin", () => {
     it("deletes tool parts when pruning a session", async () => {
         const { client, calls } = mockRawClient({ messages: SAMPLE_MESSAGES })
 
-        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
+        const hooks = await ContextCompressorPlugin(mockPluginInput({ client }))
         await hooks["command.execute.before"]?.(
-            { command: "mvp-prune-tools", sessionID: "ses_test", arguments: "" },
+            { command: "compress-prune", sessionID: "ses_test", arguments: "" },
             { parts: [] as any[] },
         )
 
@@ -237,10 +237,10 @@ describe("MvpContextPlugin", () => {
 
         const { client, calls } = mockRawClient({ messages: compressMessages })
 
-        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
+        const hooks = await ContextCompressorPlugin(mockPluginInput({ client }))
         const output = { parts: [] as any[] }
         await hooks["command.execute.before"]?.(
-            { command: "mvp-compress-all", sessionID: "ses_test", arguments: "" },
+            { command: "compress-all", sessionID: "ses_test", arguments: "" },
             output,
         )
 
@@ -310,10 +310,10 @@ describe("MvpContextPlugin", () => {
 
         const { client, calls } = mockRawClient({ messages: compressMessages })
 
-        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
+        const hooks = await ContextCompressorPlugin(mockPluginInput({ client }))
         const output = { parts: [] as any[] }
         await hooks["command.execute.before"]?.(
-            { command: "mvp-compress-all", sessionID: "ses_test", arguments: "" },
+            { command: "compress-all", sessionID: "ses_test", arguments: "" },
             output,
         )
 
@@ -339,14 +339,14 @@ describe("MvpContextPlugin", () => {
     // -----------------------------------------------------------------------
 
     it("registers a chat.message hook", async () => {
-        const hooks = await MvpContextPlugin(mockPluginInput())
+        const hooks = await ContextCompressorPlugin(mockPluginInput())
         expect(hooks["chat.message"]).toBeDefined()
     })
 
     it("does not auto-compress when total tokens are below threshold", async () => {
         const { client, calls } = mockRawClient({ messages: SAMPLE_MESSAGES })
 
-        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
+        const hooks = await ContextCompressorPlugin(mockPluginInput({ client }))
 
         // chat.message fires with no sessionID → should early-return
         await hooks["chat.message"]?.({} as any, {} as any)
@@ -382,7 +382,7 @@ describe("MvpContextPlugin", () => {
         const { client, calls } = mockRawClient({ messages: MANY_MESSAGES })
 
         // Use small window + multiple so 12 msgs × 1750 tok = 21000 > 8192 × 2 = 16384
-        const hooks = await MvpContextPlugin(
+        const hooks = await ContextCompressorPlugin(
             mockPluginInput({ client }),
             { agentContextWindow: 8192, compressTriggerMultiple: 2.0 } as any,
         )
@@ -425,7 +425,7 @@ describe("MvpContextPlugin", () => {
         const { client, calls } = mockRawClient({ messages: MANY_MESSAGES })
 
         // Use small window + multiple so compression fires and tests concurrency lock
-        const hooks = await MvpContextPlugin(
+        const hooks = await ContextCompressorPlugin(
             mockPluginInput({ client }),
             { agentContextWindow: 8192, compressTriggerMultiple: 2.0 } as any,
         )

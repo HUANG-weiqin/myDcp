@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 
-const PRUNE_COMMAND = "mvp-prune-tools"
-const COMPRESS_COMMAND = "mvp-compress-all"
+const PRUNE_COMMAND = "compress-prune"
+const COMPRESS_COMMAND = "compress-all"
 const COMPRESS_AGENT = "Compresser"
 
 interface PruneResult {
@@ -253,7 +253,7 @@ function responseText(response: any): string {
 
 // ===== Auto-trigger configuration =====
 
-interface MvpPluginConfig {
+interface CompressorPluginConfig {
     agentContextWindow?: number
     compressTriggerMultiple?: number
 }
@@ -327,7 +327,7 @@ async function doCompression(
 ): Promise<{ compressedCount: number; anchorPartID: string; deletedMessages: number }> {
     const created = responseData(
         await ctx.client.session.create({
-            body: { title: `MVP compression scratch for ${sessionID}` },
+            body: { title: `Compressor scratch for ${sessionID}` },
             query: { directory },
         }),
     )
@@ -403,10 +403,10 @@ function collectPartsFromMessages(
 // Plugin entry point
 // ---------------------------------------------------------------------------
 
-export const MvpContextPlugin: Plugin = async (ctx, options) => {
-    const pluginConfig: MvpPluginConfig = {
+export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
+    const pluginConfig: CompressorPluginConfig = {
         ...CONFIG_DEFAULTS,
-        ...(options as MvpPluginConfig | undefined),
+        ...(options as CompressorPluginConfig | undefined),
     }
     const windowTokens = Math.max(
         pluginConfig.agentContextWindow ?? CONFIG_DEFAULTS.agentContextWindow,
@@ -425,11 +425,12 @@ export const MvpContextPlugin: Plugin = async (ctx, options) => {
             config.command ??= {}
             config.command[PRUNE_COMMAND] = {
                 template: "",
-                description: "MVP: destructively replace current-session tool parts with text",
+                description: "Compressor: destructively replace current-session tool parts with text",
             }
+
             config.command[COMPRESS_COMMAND] = {
                 template: "",
-                description: "MVP: compress current-session raw parts with the Compresser agent",
+                description: "Compressor: compress current-session raw parts with the Compresser agent",
             }
         },
 
@@ -476,12 +477,12 @@ export const MvpContextPlugin: Plugin = async (ctx, options) => {
                 .then((result) => {
                     lastCompressedMsgCount = messages.length
                     console.log(
-                        `[MVP] Auto-compressed ${result.compressedCount} part(s), ` +
+                        `[Compressor] Auto-compressed ${result.compressedCount} part(s), ` +
                             `deleted ${result.deletedMessages} message(s)`,
                     )
                 })
                 .catch((err) => {
-                    console.error("[MVP] Auto-compression failed:", err)
+                    console.error("[Compressor] Auto-compression failed:", err)
                 })
                 .finally(() => {
                     compressingSessions.delete(input.sessionID)
@@ -495,7 +496,7 @@ export const MvpContextPlugin: Plugin = async (ctx, options) => {
                 output.parts.length = 0
                 output.parts.push({
                     type: "text",
-                    text: `MVP context plugin pruned ${result.prunedCount} tool part(s) for session: ${input.sessionID}.`,
+                    text: `Compressor plugin pruned ${result.prunedCount} tool part(s) for session: ${input.sessionID}.`,
                 })
                 return
             }
@@ -507,7 +508,7 @@ export const MvpContextPlugin: Plugin = async (ctx, options) => {
             const { rawParts, messages } = await collectRawParts(ctx, ctx.directory, input.sessionID)
             if (rawParts.length === 0) {
                 output.parts.length = 0
-                output.parts.push({ type: "text", text: "MVP context plugin found no raw parts to compress." })
+                output.parts.push({ type: "text", text: "Compressor plugin found no raw parts to compress." })
                 return
             }
 
@@ -516,7 +517,7 @@ export const MvpContextPlugin: Plugin = async (ctx, options) => {
             output.parts.length = 0
             output.parts.push({
                 type: "text",
-                text: `MVP context plugin compressed ${result.compressedCount} raw part(s), deleted ${result.deletedMessages} empty message(s) for session: ${input.sessionID}. Anchor: ${result.anchorPartID}.`,
+                text: `Compressor plugin compressed ${result.compressedCount} raw part(s), deleted ${result.deletedMessages} empty message(s) for session: ${input.sessionID}. Anchor: ${result.anchorPartID}.`,
             })
         },
     }

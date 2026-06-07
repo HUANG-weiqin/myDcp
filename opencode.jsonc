@@ -1,6 +1,6 @@
 {
     "plugin": [
-        ["mvp-context", {
+        ["context-compressor", {
             "agentContextWindow": 80000,
             "compressTriggerMultiple": 1.5
         }]
