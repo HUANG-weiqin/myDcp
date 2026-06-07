@@ -241,7 +241,7 @@ const MIN_MULTIPLE = 1.5
 const MESSAGE_FLOOR = 5
 const COMPRESS_COOLDOWN = 5
 
-// ===== Token estimation (rough: ~1 token per 3 chars for mixed content) =====
+// ===== Token estimation (rough: ~1 token per 4 chars for mixed content) =====
 
 function estimateTokenCount(text: string): number {
     if (!text) return 0
@@ -264,6 +264,44 @@ function estimatePartTokens(part: Record<string, unknown>): number {
     return 0
 }
 
+/**
+ * Count raw tokens for a message, using actual API token data when available.
+ *
+ * For assistant messages where ALL meaningful parts (text, reasoning, tool) are
+ * still uncompressed, we use the real `output + reasoning` token counts from the
+ * API — these are exact. Tool results are not part of `output`, so we estimate
+ * those separately via `estimatePartTokens`.
+ *
+ * For user messages, or messages with partially compressed parts, we fall back
+ * to the heuristic `length/4` estimator.
+ */
+function getMessageRawTokens(
+    msg: { info: { role: string; tokens?: { output?: number; reasoning?: number } }; parts: Array<Record<string, unknown>> },
+): number {
+    const meaningfulParts = msg.parts.filter(
+        (p) => p.type !== "step-start" && p.type !== "step-finish",
+    )
+    if (meaningfulParts.length === 0) return 0
+
+    const rawParts = meaningfulParts.filter((p) => !isAlreadyHandled(p))
+    const allRaw = rawParts.length === meaningfulParts.length
+
+    // For fully-raw assistant messages, use actual API token data (exact)
+    if (msg.info.role === "assistant" && msg.info.tokens && allRaw) {
+        let total = (msg.info.tokens.output ?? 0) + (msg.info.tokens.reasoning ?? 0)
+        // Tool results are not counted in output+reasoning — estimate them
+        for (const part of rawParts) {
+            if (part.type === "tool") total += estimatePartTokens(part)
+        }
+        return total
+    }
+
+    // Fall back: estimate all raw parts
+    let total = 0
+    for (const part of rawParts) total += estimatePartTokens(part)
+    return total
+}
+
 /** How many of the most recent messages should be protected from compression. */
 function computeProtectedCount(
     messages: Array<{ info: { role: string }; parts: Array<Record<string, unknown>> }>,
@@ -277,11 +315,7 @@ function computeProtectedCount(
         const msg = messages[i]
         protectedCount++
 
-        for (const part of msg.parts) {
-            if (part.type === "step-start" || part.type === "step-finish") continue
-            if (isAlreadyHandled(part)) continue
-            accumulated += estimatePartTokens(part)
-        }
+        accumulated += getMessageRawTokens(msg)
 
         if (protectedCount >= messageFloor && accumulated >= tokenBudget) break
     }
@@ -414,13 +448,10 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
                     .then((r: any) => r?.data ?? r)
 
             // Count total raw tokens across all messages
+            // Uses actual API token data for assistant messages where available
             let totalRawTokens = 0
             for (const msg of messages) {
-                for (const part of msg.parts) {
-                    if (part.type === "step-start" || part.type === "step-finish") continue
-                    if (isAlreadyHandled(part)) continue
-                    totalRawTokens += estimatePartTokens(part)
-                }
+                totalRawTokens += getMessageRawTokens(msg)
             }
 
             // Check threshold: trigger when total > window × multiple

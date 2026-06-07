@@ -88,7 +88,7 @@ const SAMPLE_MESSAGES = [
         ],
     },
     {
-        info: { id: "msg_2", sessionID: "ses_test", role: "assistant" },
+        info: { id: "msg_2", sessionID: "ses_test", role: "assistant", tokens: { output: 10, reasoning: 5 } },
         parts: [
             { id: "prt_reason", sessionID: "ses_test", messageID: "msg_2", type: "reasoning", text: "Let me think" },
             {
@@ -161,7 +161,7 @@ describe("ContextCompressorPlugin", () => {
                 ],
             },
             {
-                info: { id: "msg_assistant", sessionID: "ses_test", role: "assistant" },
+                info: { id: "msg_assistant", sessionID: "ses_test", role: "assistant", tokens: { output: 20, reasoning: 10 } },
                 parts: [
                     {
                         id: "prt_reasoning",
@@ -250,7 +250,7 @@ describe("ContextCompressorPlugin", () => {
                 ],
             },
             {
-                info: { id: "msg_assistant", sessionID: "ses_test", role: "assistant" },
+                info: { id: "msg_assistant", sessionID: "ses_test", role: "assistant", tokens: { output: 8, reasoning: 4 } },
                 parts: [
                     {
                         id: "prt_reasoning",
@@ -323,25 +323,34 @@ describe("ContextCompressorPlugin", () => {
         )
         const patches = calls.filter((c) => c.method === "PATCH")
         const deletes = calls.filter((c) => c.method === "DELETE")
-        // SAMPLE_MESSAGES has ~50 tokens total, far below 8192*2=16384 threshold
+        // SAMPLE_MESSAGES has actual+few tokens total, far below 8192*2=16384 threshold
         expect(patches).toHaveLength(0)
         expect(deletes).toHaveLength(0)
     })
 
     it("auto-compresses oldest messages when tokens exceed threshold", async () => {
         // Build 12 messages, each with ~1750 tokens of text → total ~21000 tokens > 16384
-        const MANY_MESSAGES = Array.from({ length: 12 }, (_, i) => ({
-            info: { id: `msg_${i}`, sessionID: "ses_test", role: i % 2 === 0 ? "user" : "assistant" },
-            parts: [
-                {
-                    id: `prt_${i}`,
+        // Assistant messages have actual token data to exercise the hybrid path
+        const MANY_MESSAGES = Array.from({ length: 12 }, (_, i) => {
+            const role = i % 2 === 0 ? "user" : "assistant"
+            return {
+                info: {
+                    id: `msg_${i}`,
                     sessionID: "ses_test",
-                    messageID: `msg_${i}`,
-                    type: "text",
-                    text: "A".repeat(7000),
+                    role,
+                    ...(role === "assistant" ? { tokens: { output: 1500, reasoning: 500 } } : {}),
                 },
-            ],
-        }))
+                parts: [
+                    {
+                        id: `prt_${i}`,
+                        sessionID: "ses_test",
+                        messageID: `msg_${i}`,
+                        type: "text",
+                        text: "A".repeat(7000),
+                    },
+                ],
+            }
+        })
 
         const { client, calls } = mockRawClient({ messages: MANY_MESSAGES })
 
@@ -373,18 +382,26 @@ describe("ContextCompressorPlugin", () => {
     })
 
     it("skips auto-compress when compression is already in progress for the same session", async () => {
-        const MANY_MESSAGES = Array.from({ length: 12 }, (_, i) => ({
-            info: { id: `msg_${i}`, sessionID: "ses_test", role: i % 2 === 0 ? "user" : "assistant" },
-            parts: [
-                {
-                    id: `prt_${i}`,
+        const MANY_MESSAGES = Array.from({ length: 12 }, (_, i) => {
+            const role = i % 2 === 0 ? "user" : "assistant"
+            return {
+                info: {
+                    id: `msg_${i}`,
                     sessionID: "ses_test",
-                    messageID: `msg_${i}`,
-                    type: "text",
-                    text: "A".repeat(7000),
+                    role,
+                    ...(role === "assistant" ? { tokens: { output: 1500, reasoning: 500 } } : {}),
                 },
-            ],
-        }))
+                parts: [
+                    {
+                        id: `prt_${i}`,
+                        sessionID: "ses_test",
+                        messageID: `msg_${i}`,
+                        type: "text",
+                        text: "A".repeat(7000),
+                    },
+                ],
+            }
+        })
 
         const { client, calls } = mockRawClient({ messages: MANY_MESSAGES })
 
