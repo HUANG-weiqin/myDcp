@@ -155,12 +155,12 @@ describe("ContextCompressorPlugin", () => {
     })
 
     it("compresses each raw part individually with per-part summarization (no deletes)", async () => {
-        // Each raw part is long enough (>80 chars) to trigger Compresser, except read tool which is direct
+        // Each raw part is long enough (>200 tokens) to trigger Compresser, except read tool which is direct
         const compressMessages = [
             {
-                info: { id: "msg_user", sessionID: "ses_test", role: "user" },
+                info: { id: "msg_user", sessionID: "ses_test", role: "assistant" },
                 parts: [
-                    { id: "prt_user", sessionID: "ses_test", messageID: "msg_user", type: "text", text: "The user wants to implement a high-fidelity compression mode that processes each message individually. ".repeat(3) },
+                    { id: "prt_user", sessionID: "ses_test", messageID: "msg_user", type: "text", text: "The user wants to implement a high-fidelity compression mode that processes each message individually. ".repeat(10) },
                 ],
             },
             {
@@ -171,7 +171,7 @@ describe("ContextCompressorPlugin", () => {
                         sessionID: "ses_test",
                         messageID: "msg_assistant",
                         type: "reasoning",
-                        text: "The AI assistant thinks about the best approach for implementing this feature. It considers several design options and trade-offs. ".repeat(3),
+                        text: "The AI assistant thinks about the best approach for implementing this feature. It considers several design options and trade-offs. ".repeat(7),
                     },
                     {
                         id: "prt_tool_read",
@@ -189,7 +189,7 @@ describe("ContextCompressorPlugin", () => {
                         type: "tool",
                         tool: "bash",
                         callID: "call_2",
-                        state: { status: "completed", input: { command: "npm test" }, output: "Test results: 42 passed, 0 failed. All tests completed successfully. ".repeat(4) },
+                        state: { status: "completed", input: { command: "npm test" }, output: "Test results: 42 passed, 0 failed. All tests completed successfully. ".repeat(13) },
                     },
                     {
                         id: "prt_existing_summary",
@@ -255,15 +255,15 @@ describe("ContextCompressorPlugin", () => {
 
         // Output message
         expect(output.parts[0].text).toContain("processed 4 part(s)")
-        expect(output.parts[0].text).toContain("1 read tools replaced directly")
+        expect(output.parts[0].text).toContain("1 tools replaced directly")
     })
 
     it("skips short parts and creates boundary message", async () => {
         const compressMessages = [
             {
-                info: { id: "msg_user", sessionID: "ses_test", role: "user" },
+                info: { id: "msg_user", sessionID: "ses_test", role: "assistant" },
                 parts: [
-                    { id: "prt_short", sessionID: "ses_test", messageID: "msg_user", type: "text", text: "Hi" }, // < 80 chars → skip
+                    { id: "prt_short", sessionID: "ses_test", messageID: "msg_user", type: "text", text: "Hi" }, // < 200 tokens → skip
                 ],
             },
             {
@@ -271,7 +271,7 @@ describe("ContextCompressorPlugin", () => {
                 parts: [
                     {
                         id: "prt_long", sessionID: "ses_test", messageID: "msg_assistant", type: "text",
-                        text: "X".repeat(200), // > 80 chars → Compresser
+                        text: "X".repeat(1000), // > 200 tokens → Compresser
                     },
                     {
                         id: "prt_read", sessionID: "ses_test", messageID: "msg_assistant", type: "tool",
@@ -296,7 +296,7 @@ describe("ContextCompressorPlugin", () => {
         expect(patches).toHaveLength(2) // prt_long + prt_read
 
         expect(output.parts[0].text).toContain("processed 2 part(s)")
-        expect(output.parts[0].text).toContain("1 read tools replaced directly")
+        expect(output.parts[0].text).toContain("1 tools replaced directly")
         expect(output.parts[0].text).toContain("1 too short skipped")
 
         // Verify boundary message was created with noReply
@@ -318,6 +318,116 @@ describe("ContextCompressorPlugin", () => {
     it("registers a chat.message hook", async () => {
         const hooks = await ContextCompressorPlugin(mockPluginInput())
         expect(hooks["chat.message"]).toBeDefined()
+    })
+
+    it("strips compressor metadata before model-message conversion", async () => {
+        const hooks = await ContextCompressorPlugin(mockPluginInput())
+        const output = {
+            messages: [
+                {
+                    info: { id: "msg_assistant", role: "assistant" },
+                    parts: [
+                        {
+                            id: "prt_compressed",
+                            type: "text",
+                            text: "compressed summary",
+                            metadata: { compressed: true, compressionBoundary: true },
+                        },
+                        {
+                            id: "prt_provider",
+                            type: "text",
+                            text: "provider metadata",
+                            metadata: { anthropic: { signature: "keep" }, compressed: true },
+                        },
+                    ],
+                },
+            ],
+        }
+
+        await hooks["experimental.chat.messages.transform"]?.({}, output as any)
+
+        expect(output.messages[0].parts[0]).not.toHaveProperty("metadata")
+        expect(output.messages[0].parts[1].metadata).toEqual({ anthropic: { signature: "keep" } })
+    })
+
+    it("transform hook does NOT affect isAlreadyHandled (plugin still sees DB-original metadata)", async () => {
+        // Simulates the real isolation:
+        //   experimental.chat.messages.transform cleans metadata for the model
+        //   plugin's own hooks read fresh metadata from DB via session.messages()
+        //   These are separate data paths — the transform should NOT leak.
+
+        // Build mock data with mixed compressed/raw parts across user and assistant messages
+        const mockData = [
+            {
+                info: { id: "msg_user", sessionID: "ses_test", role: "user" },
+                parts: [
+                    {
+                        id: "prt_already_compressed",
+                        sessionID: "ses_test", messageID: "msg_user",
+                        type: "text", text: "already compressed",
+                        metadata: { compressed: true },
+                    },
+                ],
+            },
+            {
+                info: { id: "msg_tool", sessionID: "ses_test", role: "assistant" },
+                parts: [
+                    {
+                        id: "prt_raw",
+                        sessionID: "ses_test", messageID: "msg_tool",
+                        type: "text", text: "The user wants compression implemented. ".repeat(20),
+                    },
+                    {
+                        id: "prt_read_raw",
+                        sessionID: "ses_test", messageID: "msg_tool",
+                        type: "tool", tool: "read", callID: "c1",
+                        state: { status: "completed", input: { filePath: "f.ts" }, output: "big output" },
+                    },
+                    {
+                        id: "prt_short_skip",
+                        sessionID: "ses_test", messageID: "msg_tool",
+                        type: "text", text: "hi",
+                    },
+                ],
+            },
+        ]
+
+        const { client, calls } = mockRawClient({ messages: structuredClone(mockData) })
+
+        const hooks = await ContextCompressorPlugin(mockPluginInput({ client }))
+
+        // Step 1: Call transform on a DEEP COPY (simulates OpenCode model-bound pipeline)
+        const modelBoundCopy = structuredClone(mockData)
+        await hooks["experimental.chat.messages.transform"]?.(
+            {},
+            { messages: modelBoundCopy } as any,
+        )
+        // Verify the transform actually stripped metadata on the copy
+        expect(modelBoundCopy[0].parts[0]).not.toHaveProperty("metadata")
+
+        // Step 2: Call command.execute.before — plugin reads FRESH from session.messages()
+        //         which returns the original mockData (metadata still intact)
+        const output = { parts: [] as any[] }
+        await hooks["command.execute.before"]?.(
+            { command: "compress-all", sessionID: "ses_test", arguments: "" },
+            output,
+        )
+
+        // Step 3: Verify isolation
+        // prt_already_compressed → skipped by isAlreadyHandled
+        // prt_raw → compressed (>200 tokens, Compresser)
+        // prt_read_raw → direct replaced (read tool)
+        // prt_short_skip → too short, skipped
+        const patches = calls.filter((c) => c.method === "PATCH")
+        expect(patches).toHaveLength(2) // prt_raw + prt_read_raw
+
+        // Confirm the already-compressed part was indeed skipped in the DB-read path
+        // (session.messages() still has metadata.compressed)
+        expect(output.parts[0].text).toContain("processed 2 part(s)")
+        expect(output.parts[0].text).toContain("1 tools replaced directly")
+
+        // Confirm no DELETE calls (high-fidelity mode)
+        expect(calls.filter((c) => c.method === "DELETE")).toHaveLength(0)
     })
 
     it("does not auto-compress when total tokens are below threshold", async () => {
@@ -343,15 +453,14 @@ describe("ContextCompressorPlugin", () => {
 
     it("auto-compresses oldest messages when tokens exceed threshold", async () => {
         // Build 12 messages, each with ~1750 tokens of text → total ~21000 tokens > 16384
-        // Assistant messages have actual token data to exercise the hybrid path
+        // All assistant role (user messages are kept verbatim by the compressor)
         const MANY_MESSAGES = Array.from({ length: 12 }, (_, i) => {
-            const role = i % 2 === 0 ? "user" : "assistant"
             return {
                 info: {
                     id: `msg_${i}`,
                     sessionID: "ses_test",
-                    role,
-                    ...(role === "assistant" ? { tokens: { output: 1500, reasoning: 500 } } : {}),
+                    role: "assistant",
+                    tokens: { output: 1500, reasoning: 500 },
                 },
                 parts: [
                     {

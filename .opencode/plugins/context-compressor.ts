@@ -67,6 +67,16 @@ function isAlreadyHandled(part: Record<string, unknown>): boolean {
     return part.type === "text" && typeof part.text === "string" && (part.text as string).includes("<<<MVP_COMPRESSED_CONTEXT")
 }
 
+function stripCompressorMetadata(part: Record<string, unknown>): void {
+    if (typeof part.metadata !== "object" || part.metadata === null) return
+    const metadata = part.metadata as Record<string, unknown>
+    if (metadata.compressed !== true && metadata.compressionBoundary !== true) return
+
+    delete metadata.compressed
+    delete metadata.compressionBoundary
+    if (Object.keys(metadata).length === 0) delete part.metadata
+}
+
 async function collectRawParts(
     rc: any,
     directory: string,
@@ -86,11 +96,19 @@ async function collectRawParts(
 // High-fidelity per-part compression
 // ---------------------------------------------------------------------------
 
-/** Parts shorter than this are left as-is (not worth the LLM call). */
-const MIN_COMPRESS_LENGTH = 80
+/** Parts below this many tokens are left as-is (Compresser call overhead exceeds savings). */
+const MIN_COMPRESS_TOKENS = 200
 
 function isReadTool(part: RawPart): boolean {
     return part.type === "tool" && part.tool === "read"
+}
+
+function isGlobTool(part: RawPart): boolean {
+    return part.type === "tool" && part.tool === "glob"
+}
+
+function isDirectReplaceTool(part: RawPart): boolean {
+    return isReadTool(part) || isGlobTool(part)
 }
 
 function extractReadFilePath(input: unknown): string {
@@ -103,10 +121,25 @@ function extractReadFilePath(input: unknown): string {
     return JSON.stringify(input)
 }
 
-function estimatePartLength(part: RawPart): number {
-    if (part.type === "text" || part.type === "reasoning") return (part.text ?? "").length
+function extractGlobPattern(input: unknown): string {
+    if (typeof input === "object" && input !== null) {
+        const obj = input as Record<string, unknown>
+        if (typeof obj.pattern === "string") return obj.pattern
+        if (typeof obj.include === "string") return obj.include
+    }
+    if (typeof input === "string") return input
+    return JSON.stringify(input)
+}
+
+/** Rough token estimate: ~1 token per 4 chars for mixed code/English content. */
+function estimateRawPartTokens(part: RawPart): number {
+    if (part.type === "text" || part.type === "reasoning") {
+        return Math.ceil((part.text ?? "").length / 4)
+    }
     if (part.type === "tool") {
-        return JSON.stringify(part.input ?? "").length + (part.output ?? "").length
+        const input = JSON.stringify(part.input ?? "")
+        const output = part.output ?? ""
+        return Math.ceil((input.length + output.length) / 4)
     }
     return 0
 }
@@ -297,7 +330,7 @@ async function doCompression(
             const msgID = partToMessage.get(rawPart.partID)
             if (!msgID) continue
 
-            // Read tool → direct replacement (no LLM call)
+            // Read/glob tools → direct replacement (no LLM call)
             if (isReadTool(rawPart)) {
                 const path = extractReadFilePath(rawPart.input)
                 await clientPATCH(cl, directory,
@@ -318,8 +351,29 @@ async function doCompression(
                 continue
             }
 
-            // Too short → keep original as-is
-            if (estimatePartLength(rawPart) < MIN_COMPRESS_LENGTH) {
+            // Glob tool → direct replacement (no LLM call)
+            if (isGlobTool(rawPart)) {
+                const pattern = extractGlobPattern(rawPart.input)
+                await clientPATCH(cl, directory,
+                    `/session/${sessionID}/message/${msgID}/part/${rawPart.partID}`,
+                    {
+                        id: rawPart.partID,
+                        sessionID,
+                        messageID: msgID,
+                        type: "text",
+                        text: `glob ${pattern}`,
+                        synthetic: false,
+                        ignored: false,
+                        metadata: { compressed: true },
+                    },
+                )
+                directReplacedCount++
+                compressedCount++
+                continue
+            }
+
+            // Too few tokens (Compresser call overhead > savings) → keep original as-is
+            if (estimateRawPartTokens(rawPart) < MIN_COMPRESS_TOKENS) {
                 skippedCount++
                 continue
             }
@@ -354,11 +408,11 @@ async function doCompression(
         }
         // Create a boundary summary message in the user's session (no LLM, just record keeping)
         // This marks "everything before this message is compressed history"
-        const boundaryParts = rawParts.filter(p => !isReadTool(p) && estimatePartLength(p) >= MIN_COMPRESS_LENGTH).length
+        const boundaryParts = rawParts.filter(p => !isDirectReplaceTool(p) && estimateRawPartTokens(p) >= MIN_COMPRESS_TOKENS).length
         const boundaryText = [
             `── Compression Boundary ──`,
             `Processed ${compressedCount} part(s)` +
-                (directReplacedCount > 0 ? ` (${directReplacedCount} read tools replaced directly)` : "") +
+                (directReplacedCount > 0 ? ` (${directReplacedCount} tools replaced directly)` : "") +
                 (skippedCount > 0 ? `, ${skippedCount} too short skipped` : ""),
             `${boundaryParts} part(s) summarized by Compresser agent. Original data preserved in message history.`,
         ].join("\n")
@@ -401,9 +455,17 @@ function collectPartsFromMessages(
 
     for (let i = 0; i < limit; i++) {
         const msg = messages[i]
+        if (msg.info.role === "user") continue  // user messages → preserve verbatim
+
         for (const part of msg.parts) {
             if (part.type === "step-start" || part.type === "step-finish") continue
             if (isAlreadyHandled(part)) continue
+            if ((part as any).synthetic) continue  // system-injected parts → preserve
+
+            if (part.type === "tool") {
+                const state = (part.state as Record<string, unknown>) ?? {}
+                if (state.status === "error") continue  // error tools → preserve error details verbatim
+            }
 
             const item: RawPart = {
                 partID: part.id as string,
@@ -462,6 +524,12 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
             }
         },
 
+        "experimental.chat.messages.transform": async (_input, output) => {
+            for (const msg of output.messages) {
+                for (const part of msg.parts) stripCompressorMetadata(part as Record<string, unknown>)
+            }
+        },
+
         "chat.message": async (input) => {
             if (!input.sessionID || !input.messageID) return
 
@@ -502,7 +570,7 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
                 .then((result) => {
                     lastCompressedMsgCount = messages.length
                     let msg = `[Compressor] Auto-compressed ${result.compressedCount} part(s)`
-                    if (result.directReplacedCount > 0) msg += ` (${result.directReplacedCount} read tools replaced directly)`
+                    if (result.directReplacedCount > 0) msg += ` (${result.directReplacedCount} tools replaced directly)`
                     if (result.skippedCount > 0) msg += `, ${result.skippedCount} too short skipped`
                     console.log(msg)
                 })
@@ -528,7 +596,7 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
 
             output.parts.length = 0
             let msg = `Compressor plugin processed ${result.compressedCount} part(s)`
-            if (result.directReplacedCount > 0) msg += ` (${result.directReplacedCount} read tools replaced directly)`
+            if (result.directReplacedCount > 0) msg += ` (${result.directReplacedCount} tools replaced directly)`
             if (result.skippedCount > 0) msg += `, ${result.skippedCount} too short skipped`
             msg += ` for session: ${input.sessionID}. Boundary: ${result.boundaryMsgID}.`
             output.parts.push({ type: "text", text: msg })
