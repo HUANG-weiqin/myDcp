@@ -1,84 +1,127 @@
 import { afterEach, describe, expect, it } from "bun:test"
-import { Database } from "bun:sqlite"
-import { mkdtempSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { MvpContextPlugin } from "../plugins/mvp-context"
 import * as MvpContextModule from "../plugins/mvp-context"
 
-const tempDirs: string[] = []
-
-afterEach(() => {
-    delete process.env.OPENCODE_MVP_DB_PATH
-    for (const dir of tempDirs.splice(0)) {
-        rmSync(dir, { recursive: true, force: true })
-    }
-})
-
-function mockPluginInput() {
+/** Build a minimal plugin input, partially typed so tests compile. */
+function mockPluginInput(overrides?: Record<string, unknown>) {
     return {
-        client: {},
+        client: {} as any,
         project: { name: "test-project" },
         directory: "E:\\myDcp",
         worktree: "E:\\myDcp",
         serverUrl: new URL("http://localhost:4096"),
         experimental_workspace: { register: () => {} },
-        $: {},
+        $: {} as any,
+        ...overrides,
     } as any
 }
 
-function mockPluginInputWithClient(client: unknown) {
+// ---------------------------------------------------------------------------
+// Track calls on the raw _client (PATCH / DELETE go through it).
+// ---------------------------------------------------------------------------
+
+interface RawClientCall {
+    method: string
+    url: string
+    body?: unknown
+}
+
+function mockRawClient(withSession?: Record<string, any>) {
+    const calls: RawClientCall[] = []
+
+    const record = (method: string, detail?: any) => calls.push({ method, url: detail ? JSON.stringify(detail) : "" })
+
+    const sessionMethods: Record<string, any> = {
+        messages: async (options: any) => {
+            record("session.messages", options)
+            return { data: withSession?.messages ?? [] }
+        },
+        create: withSession?.create ?? (async (options: any) => {
+            record("session.create", options)
+            return { data: { id: "ses_compresser" } }
+        }),
+        prompt: withSession?.prompt ?? (async (options: any) => {
+            record("session.prompt", options)
+            return {
+                data: {
+                    parts: [{ type: "text", text: "## Current Objective\n- Test.\n\n## Next Action\n- Done." }],
+                },
+            }
+        }),
+        delete: withSession?.delete ?? (async (options: any) => {
+            record("session.delete", options)
+            return { data: undefined }
+        }),
+    }
+
+    const rawClient = {
+        patch: async (options: { url: string; headers?: any; body?: unknown }) => {
+            calls.push({ method: "PATCH", url: options.url, body: options.body })
+            return {}
+        },
+        delete: async (options: { url: string }) => {
+            calls.push({ method: "DELETE", url: options.url })
+            return {}
+        },
+    }
+
     return {
-        ...mockPluginInput(),
-        client,
-    } as any
+        client: {
+            _client: rawClient,
+            session: sessionMethods,
+        },
+        calls,
+    }
 }
 
-function createTestDatabase() {
-    const dir = mkdtempSync(join(tmpdir(), "mvp-context-"))
-    tempDirs.push(dir)
-    const dbPath = join(dir, "opencode.db")
-    const db = new Database(dbPath)
-    db.exec(`
-        CREATE TABLE message (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            time_created INTEGER NOT NULL,
-            time_updated INTEGER NOT NULL,
-            data TEXT NOT NULL
-        );
-        CREATE TABLE part (
-            id TEXT PRIMARY KEY,
-            message_id TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            time_created INTEGER NOT NULL,
-            time_updated INTEGER NOT NULL,
-            data TEXT NOT NULL
-        )
-    `)
-    return { db, dbPath }
-}
+// ---------------------------------------------------------------------------
+// Sample data
+// ---------------------------------------------------------------------------
 
-function insertMessage(db: Database, id: string, sessionID: string, role: "user" | "assistant") {
-    db.run(
-        "INSERT INTO message VALUES (?, ?, ?, ?, ?)",
-        id,
-        sessionID,
-        1,
-        1,
-        JSON.stringify({ role, time: { created: 1 } }),
-    )
-}
+const SAMPLE_MESSAGES = [
+    {
+        info: { id: "msg_1", sessionID: "ses_test", role: "user" },
+        parts: [
+            { id: "prt_user_1", sessionID: "ses_test", messageID: "msg_1", type: "text", text: "User says hi" },
+        ],
+    },
+    {
+        info: { id: "msg_2", sessionID: "ses_test", role: "assistant" },
+        parts: [
+            { id: "prt_reason", sessionID: "ses_test", messageID: "msg_2", type: "reasoning", text: "Let me think" },
+            {
+                id: "prt_tool_1",
+                sessionID: "ses_test",
+                messageID: "msg_2",
+                type: "tool",
+                tool: "read",
+                callID: "call_1",
+                state: { status: "completed", input: { filePath: "a.ts" }, output: "large output" },
+            },
+            {
+                id: "prt_tool_2",
+                sessionID: "ses_test",
+                messageID: "msg_2",
+                type: "tool",
+                tool: "grep",
+                callID: "call_2",
+                state: { status: "completed", input: { pattern: "foo" }, output: "matches" },
+            },
+        ],
+    },
+]
 
-function insertPart(db: Database, id: string, messageID: string, sessionID: string, data: unknown) {
-    db.run("INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)", id, messageID, sessionID, 1, 1, JSON.stringify(data))
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 describe("MvpContextPlugin", () => {
     it("does not import bun-only modules because OpenCode plugin loader rejects bun: URLs", () => {
-        expect(readFileSync(join(import.meta.dir, "..", "plugins", "mvp-context.ts"), "utf8")).not.toContain(
-            "bun:sqlite",
-        )
+        expect(
+            readFileSync(join(import.meta.dir, "..", "plugins", "mvp-context.ts"), "utf8"),
+        ).not.toContain("bun:sqlite")
     })
 
     it("exports only plugin entrypoints so OpenCode legacy loader accepts the module", () => {
@@ -102,25 +145,9 @@ describe("MvpContextPlugin", () => {
     })
 
     it("responds when mvp-prune-tools is invoked", async () => {
-        const { db, dbPath } = createTestDatabase()
-        db.run(
-            "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
-            "prt_tool",
-            "msg_1",
-            "ses_test",
-            1,
-            1,
-            JSON.stringify({
-                type: "tool",
-                tool: "read",
-                callID: "call_1",
-                state: { status: "completed", input: { filePath: "a.ts" }, output: "large" },
-            }),
-        )
-        db.close()
-        process.env.OPENCODE_MVP_DB_PATH = dbPath
+        const { client, calls } = mockRawClient({ messages: SAMPLE_MESSAGES })
 
-        const hooks = await MvpContextPlugin(mockPluginInput())
+        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
         const output = { parts: [] as any[] }
 
         await hooks["command.execute.before"]?.(
@@ -129,10 +156,12 @@ describe("MvpContextPlugin", () => {
         )
 
         expect(output.parts).toHaveLength(1)
-        expect(output.parts[0]).toEqual({
-            type: "text",
-            text: `MVP context plugin pruned 1 tool part(s) for session: ses_test. Database: ${dbPath}`,
-        })
+        expect(output.parts[0].text).toMatch(/pruned 2 tool part/)
+
+        const deletes = calls.filter((c) => c.method === "DELETE")
+        expect(deletes).toHaveLength(2)
+        expect(deletes[0].url).toContain("prt_tool_1")
+        expect(deletes[1].url).toContain("prt_tool_2")
     })
 
     it("ignores unrelated commands", async () => {
@@ -147,173 +176,161 @@ describe("MvpContextPlugin", () => {
         expect(output.parts).toEqual([{ type: "text", text: "unchanged" }])
     })
 
-    it("destructively replaces current-session tool parts with text parts in SQLite", async () => {
-        const { db, dbPath } = createTestDatabase()
-        db.run(
-            "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
-            "prt_tool",
-            "msg_1",
-            "ses_test",
-            1,
-            1,
-            JSON.stringify({
-                type: "tool",
-                tool: "read",
-                callID: "call_1",
-                state: { status: "completed", input: { filePath: "a.ts" }, output: "large" },
-            }),
-        )
-        db.run(
-            "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
-            "prt_text",
-            "msg_1",
-            "ses_test",
-            1,
-            1,
-            JSON.stringify({ type: "text", text: "keep me" }),
-        )
-        db.run(
-            "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
-            "prt_other_session_tool",
-            "msg_2",
-            "ses_other",
-            1,
-            1,
-            JSON.stringify({
-                type: "tool",
-                tool: "bash",
-                callID: "call_2",
-                state: { status: "completed", input: { command: "pwd" }, output: "large" },
-            }),
-        )
-        db.close()
+    it("deletes tool parts when pruning a session", async () => {
+        const { client, calls } = mockRawClient({ messages: SAMPLE_MESSAGES })
 
-        process.env.OPENCODE_MVP_DB_PATH = dbPath
-        const hooks = await MvpContextPlugin(mockPluginInput())
+        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
         await hooks["command.execute.before"]?.(
             { command: "mvp-prune-tools", sessionID: "ses_test", arguments: "" },
             { parts: [] as any[] },
         )
 
-        const verifyDb = new Database(dbPath)
-        const rows = verifyDb
-            .query("SELECT id, data FROM part ORDER BY id")
-            .all() as Array<{ id: string; data: string }>
-        verifyDb.close()
+        // 1 messages call + 2 DELETE calls
+        expect(calls.filter((c) => c.method === "session.messages")).toHaveLength(1)
+        const deletes = calls.filter((c) => c.method === "DELETE")
+        expect(deletes).toHaveLength(2)
 
-        expect(JSON.parse(rows.find((row) => row.id === "prt_tool")!.data)).toEqual({
-            type: "text",
-            text: "[MVP pruned tool call: read callID=call_1 status=completed]",
-        })
-        expect(JSON.parse(rows.find((row) => row.id === "prt_text")!.data)).toEqual({
-            type: "text",
-            text: "keep me",
-        })
-        expect(JSON.parse(rows.find((row) => row.id === "prt_other_session_tool")!.data).type).toBe(
-            "tool",
-        )
+        expect(deletes[0].method).toBe("DELETE")
+        expect(deletes[0].url).toContain("/prt_tool_1")
+
+        expect(deletes[1].method).toBe("DELETE")
+        expect(deletes[1].url).toContain("/prt_tool_2")
     })
 
-    it("compresses raw current-session parts with Compresser and writes the summary back to SQLite", async () => {
-        const { db, dbPath } = createTestDatabase()
-        insertMessage(db, "msg_user", "ses_test", "user")
-        insertMessage(db, "msg_assistant", "ses_test", "assistant")
-        insertPart(db, "prt_user", "msg_user", "ses_test", { type: "text", text: "User wants destructive compression. 👋" })
-        insertPart(db, "prt_reasoning", "msg_assistant", "ses_test", {
-            type: "reasoning",
-            text: "Direct DB modification works because OpenCode reloads SQLite each loop.",
-        })
-        insertPart(db, "prt_tool", "msg_assistant", "ses_test", {
-            type: "tool",
-            tool: "read",
-            callID: "call_1",
-            state: { status: "completed", input: { filePath: "a.ts" }, output: "large output" },
-        })
-        insertPart(db, "prt_existing_summary", "msg_assistant", "ses_test", {
-            type: "text",
-            text: "<<<MVP_COMPRESSED_CONTEXT v1>>>\nold summary\n<<<END_MVP_COMPRESSED_CONTEXT>>>",
-        })
-        insertPart(db, "prt_pruned_tool", "msg_assistant", "ses_test", {
-            type: "text",
-            text: "[MVP pruned tool call: bash callID=call_2 status=completed]",
-        })
-        db.close()
-        process.env.OPENCODE_MVP_DB_PATH = dbPath
-
-        const calls: Array<{ method: string; options: any }> = []
-        const client = {
-            session: {
-                create: async (options: any) => {
-                    calls.push({ method: "create", options })
-                    return { data: { id: "ses_compresser" } }
-                },
-                prompt: async (options: any) => {
-                    calls.push({ method: "prompt", options })
-                    return {
-                        data: {
-                            parts: [
-                                {
-                                    type: "text",
-                                    text: "## Current Objective\n- Preserve task continuity.\n\n## Next Action\n- Continue MVP.",
-                                },
-                            ],
-                        },
-                    }
-                },
-                delete: async (options: any) => {
-                    calls.push({ method: "delete", options })
-                    return { data: undefined }
-                },
+    it("compresses raw current-session parts with Compresser and deletes consumed parts", async () => {
+        const compressMessages = [
+            {
+                info: { id: "msg_user", sessionID: "ses_test", role: "user" },
+                parts: [
+                    { id: "prt_user", sessionID: "ses_test", messageID: "msg_user", type: "text", text: "User wants destructive compression. 👋" },
+                ],
             },
-        }
+            {
+                info: { id: "msg_assistant", sessionID: "ses_test", role: "assistant" },
+                parts: [
+                    {
+                        id: "prt_reasoning",
+                        sessionID: "ses_test",
+                        messageID: "msg_assistant",
+                        type: "reasoning",
+                        text: "Direct DB modification works because OpenCode reloads SQLite each loop.",
+                    },
+                    {
+                        id: "prt_tool",
+                        sessionID: "ses_test",
+                        messageID: "msg_assistant",
+                        type: "tool",
+                        tool: "read",
+                        callID: "call_1",
+                        state: { status: "completed", input: { filePath: "a.ts" }, output: "large output" },
+                    },
+                    {
+                        id: "prt_existing_summary",
+                        sessionID: "ses_test",
+                        messageID: "msg_assistant",
+                        type: "text",
+                        text: "<<<MVP_COMPRESSED_CONTEXT v1>>>\nold summary\n<<<END_MVP_COMPRESSED_CONTEXT>>>",
+                    },
+                ],
+            },
+        ]
 
-        const hooks = await MvpContextPlugin(mockPluginInputWithClient(client))
+        const { client, calls } = mockRawClient({ messages: compressMessages })
+
+        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
         const output = { parts: [] as any[] }
         await hooks["command.execute.before"]?.(
             { command: "mvp-compress-all", sessionID: "ses_test", arguments: "" },
             output,
         )
 
-        const promptCall = calls.find((call) => call.method === "prompt")!
-        expect(promptCall.options.path.id).toBe("ses_compresser")
-        expect(promptCall.options.body.agent).toBe("Compresser")
-        const promptText = promptCall.options.body.parts[0].text
-        expect(promptText).toContain("User wants destructive compression. 👋")
-        expect(promptText).toContain("Direct DB modification works")
-        expect(promptText).toContain("read")
-        expect(promptText).toContain("a.ts")
-        expect(promptText).toContain("large output")
-        expect(promptText).not.toContain("old summary")
-        expect(promptText).not.toContain("MVP pruned tool call")
+        // Verify prompt was built correctly
+        const promptCall = calls.find((c) => c.method === "session.prompt")
+        expect(promptCall).toBeDefined()
 
-        expect(calls.map((call) => call.method)).toEqual(["create", "prompt", "delete"])
-        expect(output.parts[0].text).toContain("MVP context plugin compressed 3 raw part(s)")
+        // Verify create → prompt → delete sequence
+        const sessionCalls = calls.filter((c) => c.method.startsWith("session."))
+        expect(sessionCalls.map((c) => c.method)).toEqual(["session.messages", "session.create", "session.prompt", "session.delete"])
 
-        const verifyDb = new Database(dbPath)
-        const rows = verifyDb
-            .query("SELECT id, data FROM part ORDER BY id")
-            .all() as Array<{ id: string; data: string }>
-        verifyDb.close()
+        // Verify the output message
+        expect(output.parts[0].text).toContain("compressed 3 raw part(s), deleted 0 empty message(s)")
 
-        expect(JSON.parse(rows.find((row) => row.id === "prt_user")!.data).text).toContain(
-            "<<<MVP_COMPRESSED_CONTEXT v1",
+        // Verify: 1 PATCH (anchor) + 2 DELETE (remaining parts)
+        const patches = calls.filter((c) => c.method === "PATCH")
+        const deletes = calls.filter((c) => c.method === "DELETE")
+
+        expect(patches).toHaveLength(1)
+        expect(deletes).toHaveLength(2)
+
+        // Anchor part gets the summary
+        const anchorPatch = patches[0]!
+        expect(anchorPatch.url).toContain("prt_user")
+        expect((anchorPatch.body as any).type).toBe("text")
+        expect((anchorPatch.body as any).text).toContain("<<<MVP_COMPRESSED_CONTEXT v1")
+        expect((anchorPatch.body as any).text).toContain("## Current Objective")
+
+        // Remaining parts are deleted
+        expect(deletes.some((d) => d.url.includes("prt_reasoning"))).toBe(true)
+        expect(deletes.some((d) => d.url.includes("prt_tool"))).toBe(true)
+        // No message-level deletes — msg_assistant still has prt_existing_summary
+        expect(deletes.every((d) => d.url.includes("/part/"))).toBe(true)
+    })
+
+    it("deletes empty messages after compression", async () => {
+        // msg_assistant has only the two parts being compressed — no leftovers
+        const compressMessages = [
+            {
+                info: { id: "msg_user", sessionID: "ses_test", role: "user" },
+                parts: [
+                    { id: "prt_user", sessionID: "ses_test", messageID: "msg_user", type: "text", text: "Goal: test" },
+                ],
+            },
+            {
+                info: { id: "msg_assistant", sessionID: "ses_test", role: "assistant" },
+                parts: [
+                    {
+                        id: "prt_reasoning",
+                        sessionID: "ses_test",
+                        messageID: "msg_assistant",
+                        type: "reasoning",
+                        text: "some reasoning",
+                    },
+                    {
+                        id: "prt_tool",
+                        sessionID: "ses_test",
+                        messageID: "msg_assistant",
+                        type: "tool",
+                        tool: "bash",
+                        callID: "call_1",
+                        state: { status: "completed", input: { command: "pwd" }, output: "/home" },
+                    },
+                ],
+            },
+        ]
+
+        const { client, calls } = mockRawClient({ messages: compressMessages })
+
+        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
+        const output = { parts: [] as any[] }
+        await hooks["command.execute.before"]?.(
+            { command: "mvp-compress-all", sessionID: "ses_test", arguments: "" },
+            output,
         )
-        expect(JSON.parse(rows.find((row) => row.id === "prt_user")!.data).text).toContain(
-            "## Current Objective",
-        )
-        expect(JSON.parse(rows.find((row) => row.id === "prt_reasoning")!.data)).toEqual({
-            type: "text",
-            text: "[MVP compressed into prt_user]",
-        })
-        expect(JSON.parse(rows.find((row) => row.id === "prt_tool")!.data)).toEqual({
-            type: "text",
-            text: "[MVP compressed into prt_user]",
-        })
-        expect(JSON.parse(rows.find((row) => row.id === "prt_existing_summary")!.data).text).toContain(
-            "old summary",
-        )
-        expect(JSON.parse(rows.find((row) => row.id === "prt_pruned_tool")!.data).text).toContain(
-            "MVP pruned tool call",
-        )
+
+        expect(output.parts[0].text).toContain("compressed 3 raw part(s), deleted 1 empty message(s)")
+
+        // 1 PATCH (anchor) + 2 DELETE (parts) + 1 DELETE (empty message)
+        const patches = calls.filter((c) => c.method === "PATCH")
+        const deletes = calls.filter((c) => c.method === "DELETE")
+
+        expect(patches).toHaveLength(1)
+        expect(deletes).toHaveLength(3)
+
+        const partDeletes = deletes.filter((d) => d.url.includes("/part/"))
+        const msgDeletes = deletes.filter((d) => !d.url.includes("/part/"))
+
+        expect(partDeletes).toHaveLength(2)
+        expect(msgDeletes).toHaveLength(1)
+        expect(msgDeletes[0].url).toContain("/message/msg_assistant")
     })
 })

@@ -1,7 +1,4 @@
 import type { Plugin } from "@opencode-ai/plugin"
-import { spawnSync } from "node:child_process"
-import { homedir } from "node:os"
-import { join } from "node:path"
 
 const PRUNE_COMMAND = "mvp-prune-tools"
 const COMPRESS_COMMAND = "mvp-compress-all"
@@ -24,173 +21,200 @@ interface RawPart {
     output?: string
 }
 
-function defaultDatabasePath(): string {
-    return (
-        process.env.OPENCODE_MVP_DB_PATH ||
-        join(homedir(), ".local", "share", "opencode", "opencode.db")
-    )
+// ---------------------------------------------------------------------------
+// SDK-backed helpers — reuse ctx.client's built-in auth
+// ---------------------------------------------------------------------------
+
+/** Extract the underlying hey-api Client from the SDK client for PATCH/DELETE. */
+function rawClient(ctx: { client: any }): any {
+    return (ctx.client as any)._client
 }
 
-function pruneToolPartsInDatabase(dbPath: string, sessionID: string): PruneResult {
-    const result = spawnSync(
-        "python",
-        [
-            "-c",
-            `import json, sqlite3, sys, time
-db_path = sys.argv[1]
-session_id = sys.argv[2]
-con = sqlite3.connect(db_path, timeout=5)
-try:
-    rows = con.execute("SELECT id, data FROM part WHERE session_id = ?", (session_id,)).fetchall()
-    pruned = 0
-    for part_id, raw_data in rows:
-        data = json.loads(raw_data)
-        if data.get("type") != "tool":
-            continue
-        replacement = {
-            "type": "text",
-            "text": "[MVP pruned tool call: {} callID={} status={}]".format(
-                data.get("tool", "unknown"),
-                data.get("callID", "unknown"),
-                data.get("state", {}).get("status", "unknown"),
-            ),
+function dirQuery(directory: string): string {
+    return `?directory=${encodeURIComponent(directory)}`
+}
+
+async function fetchMessages(ctx: { client: any; directory: string }, sessionID: string): Promise<any> {
+    const response = await ctx.client.session.messages({
+        path: { id: sessionID },
+        query: { directory: ctx.directory },
+    })
+    return response?.data ?? response
+}
+
+async function clientPATCH(
+    client: any,
+    directory: string,
+    path: string,
+    body: Record<string, unknown>,
+): Promise<void> {
+    const result = await client.patch({
+        url: path + dirQuery(directory),
+        headers: { "Content-Type": "application/json" },
+        body: body,
+    })
+    if (result.error) throw new Error(`PATCH ${path} failed: ${JSON.stringify(result.error)}`)
+}
+
+async function clientDELETE(client: any, directory: string, path: string): Promise<void> {
+    const result = await client.delete({
+        url: path + dirQuery(directory),
+    })
+    if (result.error) throw new Error(`DELETE ${path} failed: ${JSON.stringify(result.error)}`)
+}
+
+// ---------------------------------------------------------------------------
+// Prune: delete all tool parts from a session
+// ---------------------------------------------------------------------------
+
+async function pruneToolParts(rc: any, directory: string, sessionID: string): Promise<PruneResult> {
+    const messages = await rc.client.session.messages({
+        path: { id: sessionID },
+        query: { directory },
+    }).then((r: any) => r?.data ?? r)
+
+    const cl = rawClient(rc)
+    let prunedCount = 0
+    for (const msg of messages) {
+        for (const part of msg.parts) {
+            if (part.type !== "tool") continue
+
+            await clientDELETE(cl, directory, `/session/${sessionID}/message/${msg.info.id}/part/${part.id}`)
+            prunedCount++
         }
-        con.execute(
-            "UPDATE part SET data = ?, time_updated = ? WHERE id = ?",
-            (json.dumps(replacement, separators=(",", ":")), int(time.time() * 1000), part_id),
-        )
-        pruned += 1
-    con.commit()
-    print(json.dumps({"prunedCount": pruned}))
-finally:
-    con.close()
-`,
-            dbPath,
-            sessionID,
-        ],
-        { encoding: "utf8" },
-    )
-
-    if (result.status !== 0) {
-        throw new Error(result.stderr || result.stdout || "failed to prune tool parts")
     }
-
-    return JSON.parse(result.stdout) as PruneResult
+    return { prunedCount }
 }
 
-function collectRawPartsForCompression(dbPath: string, sessionID: string): RawPart[] {
-    const result = spawnSync(
-        "python",
-        [
-            "-c",
-            `import json, sqlite3, sys
-db_path = sys.argv[1]
-session_id = sys.argv[2]
-con = sqlite3.connect(db_path, timeout=5)
-try:
-    rows = con.execute("""
-        SELECT p.id, p.message_id, p.data, m.data
-        FROM part p
-        LEFT JOIN message m ON m.id = p.message_id
-        WHERE p.session_id = ?
-        ORDER BY m.time_created, CASE json_extract(m.data, '$.role') WHEN 'user' THEN 0 ELSE 1 END, p.time_created, p.id
-    """, (session_id,)).fetchall()
-    parts = []
-    for part_id, message_id, raw_part, raw_message in rows:
-        part = json.loads(raw_part)
-        text = part.get("text", "") if isinstance(part.get("text"), str) else ""
-        if part.get("type") == "text" and (
-            "<<<MVP_COMPRESSED_CONTEXT" in text
-            or text.startswith("[MVP compressed into")
-            or text.startswith("[MVP pruned tool call:")
-        ):
-            continue
-        if part.get("type") in ("step-start", "step-finish"):
-            continue
-        role = "unknown"
-        if raw_message:
-            try:
-                role = json.loads(raw_message).get("role", "unknown")
-            except Exception:
-                role = "unknown"
-        item = {
-            "partID": part_id,
-            "messageID": message_id,
-            "role": role,
-            "type": part.get("type", "unknown"),
+// ---------------------------------------------------------------------------
+// Collect raw parts for compression (skip already compressed / pruned ones)
+// ---------------------------------------------------------------------------
+
+function isAlreadyHandled(part: Record<string, unknown>): boolean {
+    // Only the anchor summary text part remains after compression;
+    // all other compressed/pruned parts are deleted from DB.
+    return part.type === "text" && typeof part.text === "string" && (part.text as string).includes("<<<MVP_COMPRESSED_CONTEXT")
+}
+
+async function collectRawParts(
+    rc: any,
+    directory: string,
+    sessionID: string,
+): Promise<{ rawParts: RawPart[]; messages: Array<{ info: { id: string }; parts: Array<Record<string, unknown>> }> }> {
+    const messages: Array<{ info: { id: string; role: string }; parts: Array<Record<string, unknown>> }> = await rc.client.session
+        .messages({ path: { id: sessionID }, query: { directory } })
+        .then((r: any) => r?.data ?? r)
+
+    const rawParts: RawPart[] = []
+
+    for (const msg of messages) {
+        for (const part of msg.parts) {
+            if (part.type === "step-start" || part.type === "step-finish") continue
+            if (isAlreadyHandled(part)) continue
+
+            const item: RawPart = {
+                partID: part.id as string,
+                messageID: msg.info.id,
+                role: msg.info.role,
+                type: part.type as string,
+            }
+
+            if (part.type === "text" || part.type === "reasoning") {
+                item.text = typeof part.text === "string" ? part.text : ""
+            }
+
+            if (part.type === "tool") {
+                const state = (part.state as Record<string, unknown>) ?? {}
+                item.tool = part.tool as string
+                item.callID = part.callID as string
+                item.status = state.status as string
+                item.input = state.input
+                item.output = typeof state.output === "string" ? state.output : ""
+            }
+
+            rawParts.push(item)
         }
-        if part.get("type") in ("text", "reasoning"):
-            item["text"] = text
-        if part.get("type") == "tool":
-            state = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
-            item.update({
-                "tool": part.get("tool", "unknown"),
-                "callID": part.get("callID", "unknown"),
-                "status": state.get("status", "unknown"),
-                "input": state.get("input"),
-                "output": state.get("output", ""),
-            })
-        parts.append(item)
-    print(json.dumps(parts))
-finally:
-    con.close()
-`,
-            dbPath,
-            sessionID,
-        ],
-        { encoding: "utf8", maxBuffer: 1024 * 1024 * 100 },
-    )
-
-    if (result.status !== 0) {
-        throw new Error(result.stderr || result.stdout || "failed to collect raw parts")
     }
 
-    return JSON.parse(result.stdout) as RawPart[]
+    return { rawParts, messages }
 }
 
-function writeCompressionSummaryToDatabase(dbPath: string, sessionID: string, partIDs: string[], summary: string) {
-    const result = spawnSync(
-        "python",
-        [
-            "-c",
-            `import json, sqlite3, sys, time
-db_path = sys.argv[1]
-session_id = sys.argv[2]
-part_ids = json.loads(sys.argv[3])
-summary = sys.argv[4]
-anchor = part_ids[0]
-wrapped = "<<<MVP_COMPRESSED_CONTEXT v1\\nsource_parts={}\\nmode=task-continuity\\n>>>\\n{}\\n<<<END_MVP_COMPRESSED_CONTEXT>>>".format(len(part_ids), summary.strip())
-con = sqlite3.connect(db_path, timeout=5)
-try:
-    now = int(time.time() * 1000)
-    con.execute(
-        "UPDATE part SET data = ?, time_updated = ? WHERE id = ? AND session_id = ?",
-        (json.dumps({"type": "text", "text": wrapped}, separators=(",", ":"), ensure_ascii=False), now, anchor, session_id),
-    )
-    for part_id in part_ids[1:]:
-        con.execute(
-            "UPDATE part SET data = ?, time_updated = ? WHERE id = ? AND session_id = ?",
-            (json.dumps({"type": "text", "text": "[MVP compressed into {}]".format(anchor)}, separators=(",", ":"), ensure_ascii=False), now, part_id, session_id),
-        )
-    con.commit()
-    print(json.dumps({"compressedCount": len(part_ids), "anchorPartID": anchor}))
-finally:
-    con.close()
-`,
-            dbPath,
-            sessionID,
-            JSON.stringify(partIDs),
-            summary,
-        ],
-        { encoding: "utf8", maxBuffer: 1024 * 1024 * 100 },
-    )
+// ---------------------------------------------------------------------------
+// Write compression summary back via PATCH
+// ---------------------------------------------------------------------------
 
-    if (result.status !== 0) {
-        throw new Error(result.stderr || result.stdout || "failed to write compression summary")
+async function writeCompressionSummary(
+    rc: any,
+    directory: string,
+    sessionID: string,
+    partIDs: string[],
+    summary: string,
+    messages: Array<{ info: { id: string }; parts: Array<Record<string, unknown>> }>,
+): Promise<{ compressedCount: number; anchorPartID: string; deletedMessages: number }> {
+    const cl = rawClient(rc)
+    const anchor = partIDs[0]
+    const consumedPartIDs = new Set(partIDs)
+
+    // Build partID → messageID lookup + track which messages lose parts
+    const partToMessage = new Map<string, string>()
+    const affectedMessages = new Set<string>()
+    for (const msg of messages) {
+        for (const part of msg.parts) {
+            partToMessage.set(part.id as string, msg.info.id)
+            if (consumedPartIDs.has(part.id as string) && part.id !== anchor) {
+                affectedMessages.add(msg.info.id)
+            }
+        }
     }
 
-    return JSON.parse(result.stdout) as { compressedCount: number; anchorPartID: string }
+    const wrapped = `<<<MVP_COMPRESSED_CONTEXT v1\nsource_parts=${partIDs.length}\nmode=task-continuity\n>>>\n${summary.trim()}\n<<<END_MVP_COMPRESSED_CONTEXT>>>`
+
+    // Update anchor part with the full summary
+    const anchorMsgID = partToMessage.get(anchor)
+    if (anchorMsgID) {
+        affectedMessages.delete(anchorMsgID)
+        await clientPATCH(cl, directory, `/session/${sessionID}/message/${anchorMsgID}/part/${anchor}`, {
+            id: anchor,
+            sessionID,
+            messageID: anchorMsgID,
+            type: "text",
+            text: wrapped,
+            synthetic: false,
+            ignored: false,
+        })
+    }
+
+    // Delete remaining parts (no longer needed — their content is in the summary)
+    for (const partID of partIDs.slice(1)) {
+        const msgID = partToMessage.get(partID)
+        if (msgID) {
+            await clientDELETE(cl, directory, `/session/${sessionID}/message/${msgID}/part/${partID}`)
+        }
+    }
+
+    // Delete any message that ended up with zero meaningful parts
+    let deletedMessages = 0
+    for (const msgID of affectedMessages) {
+        const msg = messages.find((m) => m.info.id === msgID)
+        if (!msg) continue
+
+        const untouched = msg.parts.filter((p) => !consumedPartIDs.has(p.id as string))
+        // Also strip scaffolding parts (step-start/step-finish/snapshot) that serve no purpose alone
+        const bareScaffolding =
+            untouched.length > 0 &&
+            untouched.every((p) => p.type === "step-start" || p.type === "step-finish" || p.type === "snapshot")
+        if (untouched.length === 0 || bareScaffolding) {
+            await clientDELETE(cl, directory, `/session/${sessionID}/message/${msgID}`)
+            deletedMessages++
+        }
+    }
+
+    return { compressedCount: partIDs.length, anchorPartID: anchor, deletedMessages }
 }
+
+// ---------------------------------------------------------------------------
+// Prompt building (unchanged from original)
+// ---------------------------------------------------------------------------
 
 function buildCompressionPrompt(parts: RawPart[]): string {
     return [
@@ -235,6 +259,10 @@ function formatRawPart(part: RawPart): string {
     ].join("\n")
 }
 
+// ---------------------------------------------------------------------------
+// Plugin helper
+// ---------------------------------------------------------------------------
+
 function responseData(response: any) {
     return response?.data ?? response
 }
@@ -250,6 +278,10 @@ function responseText(response: any): string {
     if (!text) throw new Error("Compresser returned no text summary")
     return text
 }
+
+// ---------------------------------------------------------------------------
+// Plugin entry point
+// ---------------------------------------------------------------------------
 
 export const MvpContextPlugin: Plugin = async (ctx) => {
     return {
@@ -267,13 +299,12 @@ export const MvpContextPlugin: Plugin = async (ctx) => {
 
         "command.execute.before": async (input, output) => {
             if (input.command === PRUNE_COMMAND) {
-                const dbPath = defaultDatabasePath()
-                const result = pruneToolPartsInDatabase(dbPath, input.sessionID)
+                const result = await pruneToolParts(ctx, ctx.directory, input.sessionID)
 
                 output.parts.length = 0
                 output.parts.push({
                     type: "text",
-                    text: `MVP context plugin pruned ${result.prunedCount} tool part(s) for session: ${input.sessionID}. Database: ${dbPath}`,
+                    text: `MVP context plugin pruned ${result.prunedCount} tool part(s) for session: ${input.sessionID}.`,
                 })
                 return
             }
@@ -282,8 +313,7 @@ export const MvpContextPlugin: Plugin = async (ctx) => {
                 return
             }
 
-            const dbPath = defaultDatabasePath()
-            const rawParts = collectRawPartsForCompression(dbPath, input.sessionID)
+            const { rawParts, messages } = await collectRawParts(ctx, ctx.directory, input.sessionID)
             if (rawParts.length === 0) {
                 output.parts.length = 0
                 output.parts.push({ type: "text", text: "MVP context plugin found no raw parts to compress." })
@@ -309,17 +339,19 @@ export const MvpContextPlugin: Plugin = async (ctx) => {
                         query: { directory: ctx.directory },
                     }),
                 )
-                const result = writeCompressionSummaryToDatabase(
-                    dbPath,
+                const result = await writeCompressionSummary(
+                    ctx,
+                    ctx.directory,
                     input.sessionID,
                     rawParts.map((part) => part.partID),
                     summary,
+                    messages,
                 )
 
                 output.parts.length = 0
                 output.parts.push({
                     type: "text",
-                    text: `MVP context plugin compressed ${result.compressedCount} raw part(s) for session: ${input.sessionID}. Anchor: ${result.anchorPartID}. Database: ${dbPath}`,
+                    text: `MVP context plugin compressed ${result.compressedCount} raw part(s), deleted ${result.deletedMessages} empty message(s) for session: ${input.sessionID}. Anchor: ${result.anchorPartID}.`,
                 })
             } finally {
                 await ctx.client.session.delete({ path: { id: tempSessionID } })
