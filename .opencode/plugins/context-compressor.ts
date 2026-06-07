@@ -132,7 +132,9 @@ function estimateRawPartTokens(part: RawPart): number {
 function buildSinglePartPrompt(part: RawPart): string {
     const instruction = part.type === "tool"
         ? "Summarize this command execution. Preserve: exact command, key results (file paths, line counts, matches), errors, and status. Drop verbose logs and repeated lines."
-        : "Summarize this assistant message. Preserve: key decisions, file paths, user constraints addressed, and code references. Drop verbose explanations and examples."
+        : part.type === "reasoning"
+            ? "Summarize this reasoning trace. Preserve: the logical chain, key decisions, alternatives considered, pitfalls identified, and conclusions. Keep causal links between steps. Drop verbose introspection and repeated deliberation."
+            : "Summarize this assistant message. Preserve: key decisions, file paths, user constraints addressed, and code references. Drop verbose explanations and examples."
 
     return [
         instruction,
@@ -475,6 +477,7 @@ function collectPartsFromMessages(
 
             const allow = isDirectReplace
                 || (msg.info.role === "assistant" && part.type === "text" && !isSynthetic)
+                || (msg.info.role === "assistant" && part.type === "reasoning")
                 || (msg.info.role === "assistant" && part.type === "tool" && !isError && partTool !== "edit" && partTool !== "skill")
 
             if (!allow) continue
