@@ -323,6 +323,11 @@ async function doCompression(
     let skippedCount = 0
     let boundaryMsgID = ""
 
+    // Collect all PATCH operations in a buffer, apply in batch at the end.
+    // This avoids the main agent seeing individual parts being modified
+    // mid-stream, which would invalidate its cache on every single write.
+    const pendingPatches: Array<{ path: string; body: any }> = []
+
     // Create temp session (reused for all per-part prompts)
     const created = responseData(
         await ctx.client.session.create({
@@ -348,9 +353,9 @@ async function doCompression(
                     label = "glob"
                     text = extractGlobPattern(rawPart.input)
                 }
-                await clientPATCH(cl, directory,
-                    `/session/${sessionID}/message/${msgID}/part/${rawPart.partID}`,
-                    {
+                pendingPatches.push({
+                    path: `/session/${sessionID}/message/${msgID}/part/${rawPart.partID}`,
+                    body: {
                         id: rawPart.partID,
                         sessionID,
                         messageID: msgID,
@@ -360,7 +365,7 @@ async function doCompression(
                         ignored: false,
                         metadata: { compressed: true },
                     },
-                )
+                })
                 directReplacedCount++
                 compressedCount++
                 continue
@@ -384,10 +389,10 @@ async function doCompression(
                 }),
             )
 
-            // PATCH original part with per-part summary
-            await clientPATCH(cl, directory,
-                `/session/${sessionID}/message/${msgID}/part/${rawPart.partID}`,
-                {
+            // Queue the PATCH (will apply in batch after all parts processed)
+            pendingPatches.push({
+                path: `/session/${sessionID}/message/${msgID}/part/${rawPart.partID}`,
+                body: {
                     id: rawPart.partID,
                     sessionID,
                     messageID: msgID,
@@ -397,8 +402,13 @@ async function doCompression(
                     ignored: false,
                     metadata: { compressed: true },
                 },
-            )
+            })
             compressedCount++
+        }
+
+        // Flush all queued patches atomically — single cache invalidation
+        for (const p of pendingPatches) {
+            await clientPATCH(cl, directory, p.path, p.body)
         }
         // Create a boundary summary message in the user's session (no LLM, just record keeping)
         // This marks "everything before this message is compressed history"
