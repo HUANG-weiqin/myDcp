@@ -91,8 +91,9 @@ async function pruneToolParts(rc: any, directory: string, sessionID: string): Pr
 // ---------------------------------------------------------------------------
 
 function isAlreadyHandled(part: Record<string, unknown>): boolean {
-    // Only the anchor summary text part remains after compression;
-    // all other compressed/pruned parts are deleted from DB.
+    // New format: type field marks compressed parts directly
+    if (part.type === "compressed") return true
+    // Legacy: check for old <<<MVP_COMPRESSED_CONTEXT>>> header markers
     return part.type === "text" && typeof part.text === "string" && (part.text as string).includes("<<<MVP_COMPRESSED_CONTEXT")
 }
 
@@ -139,9 +140,7 @@ async function writeCompressionSummary(
         }
     }
 
-    const wrapped = `<<<MVP_COMPRESSED_CONTEXT v1\nsource_parts=${partIDs.length}\nmode=task-continuity\n>>>\n${summary.trim()}\n<<<END_MVP_COMPRESSED_CONTEXT>>>`
-
-    // Update anchor part with the full summary
+    // Update anchor part: use dedicated type to avoid ugly markers in chat window
     const anchorMsgID = partToMessage.get(anchor)
     if (anchorMsgID) {
         affectedMessages.delete(anchorMsgID)
@@ -149,8 +148,8 @@ async function writeCompressionSummary(
             id: anchor,
             sessionID,
             messageID: anchorMsgID,
-            type: "text",
-            text: wrapped,
+            type: "compressed",
+            text: summary.trim(),
             synthetic: false,
             ignored: false,
         })
@@ -260,7 +259,7 @@ interface MvpPluginConfig {
 }
 
 const CONFIG_DEFAULTS = {
-    agentContextWindow: 100000,
+    agentContextWindow: 80000,
     compressTriggerMultiple: 1.5,
 } as const
 
