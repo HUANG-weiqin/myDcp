@@ -134,34 +134,10 @@ describe("ContextCompressorPlugin", () => {
 
         await hooks.config?.(config)
 
-        expect(config.command?.["compress-prune"]).toEqual({
-            template: "",
-            description: "Compressor: destructively replace current-session tool parts with text",
-        })
         expect(config.command?.["compress-all"]).toEqual({
             template: "",
             description: "Compressor: compress current-session raw parts with the Compresser agent",
         })
-    })
-
-    it("responds when compress-prune is invoked", async () => {
-        const { client, calls } = mockRawClient({ messages: SAMPLE_MESSAGES })
-
-        const hooks = await ContextCompressorPlugin(mockPluginInput({ client }))
-        const output = { parts: [] as any[] }
-
-        await hooks["command.execute.before"]?.(
-            { command: "compress-prune", sessionID: "ses_test", arguments: "" },
-            output,
-        )
-
-        expect(output.parts).toHaveLength(1)
-        expect(output.parts[0].text).toMatch(/pruned 2 tool part/)
-
-        const deletes = calls.filter((c) => c.method === "DELETE")
-        expect(deletes).toHaveLength(2)
-        expect(deletes[0].url).toContain("prt_tool_1")
-        expect(deletes[1].url).toContain("prt_tool_2")
     })
 
     it("ignores unrelated commands", async () => {
@@ -174,27 +150,6 @@ describe("ContextCompressorPlugin", () => {
         )
 
         expect(output.parts).toEqual([{ type: "text", text: "unchanged" }])
-    })
-
-    it("deletes tool parts when pruning a session", async () => {
-        const { client, calls } = mockRawClient({ messages: SAMPLE_MESSAGES })
-
-        const hooks = await ContextCompressorPlugin(mockPluginInput({ client }))
-        await hooks["command.execute.before"]?.(
-            { command: "compress-prune", sessionID: "ses_test", arguments: "" },
-            { parts: [] as any[] },
-        )
-
-        // 1 messages call + 2 DELETE calls
-        expect(calls.filter((c) => c.method === "session.messages")).toHaveLength(1)
-        const deletes = calls.filter((c) => c.method === "DELETE")
-        expect(deletes).toHaveLength(2)
-
-        expect(deletes[0].method).toBe("DELETE")
-        expect(deletes[0].url).toContain("/prt_tool_1")
-
-        expect(deletes[1].method).toBe("DELETE")
-        expect(deletes[1].url).toContain("/prt_tool_2")
     })
 
     it("compresses raw current-session parts with Compresser and deletes consumed parts", async () => {

@@ -1,12 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 
-const PRUNE_COMMAND = "compress-prune"
 const COMPRESS_COMMAND = "compress-all"
 const COMPRESS_AGENT = "Compresser"
-
-interface PruneResult {
-    prunedCount: number
-}
 
 interface RawPart {
     partID: string
@@ -61,29 +56,6 @@ async function clientDELETE(client: any, directory: string, path: string): Promi
         url: path + dirQuery(directory),
     })
     if (result.error) throw new Error(`DELETE ${path} failed: ${JSON.stringify(result.error)}`)
-}
-
-// ---------------------------------------------------------------------------
-// Prune: delete all tool parts from a session
-// ---------------------------------------------------------------------------
-
-async function pruneToolParts(rc: any, directory: string, sessionID: string): Promise<PruneResult> {
-    const messages = await rc.client.session.messages({
-        path: { id: sessionID },
-        query: { directory },
-    }).then((r: any) => r?.data ?? r)
-
-    const cl = rawClient(rc)
-    let prunedCount = 0
-    for (const msg of messages) {
-        for (const part of msg.parts) {
-            if (part.type !== "tool") continue
-
-            await clientDELETE(cl, directory, `/session/${sessionID}/message/${msg.info.id}/part/${part.id}`)
-            prunedCount++
-        }
-    }
-    return { prunedCount }
 }
 
 // ---------------------------------------------------------------------------
@@ -423,11 +395,6 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
     return {
         config: async (config) => {
             config.command ??= {}
-            config.command[PRUNE_COMMAND] = {
-                template: "",
-                description: "Compressor: destructively replace current-session tool parts with text",
-            }
-
             config.command[COMPRESS_COMMAND] = {
                 template: "",
                 description: "Compressor: compress current-session raw parts with the Compresser agent",
@@ -490,20 +457,7 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
         },
 
         "command.execute.before": async (input, output) => {
-            if (input.command === PRUNE_COMMAND) {
-                const result = await pruneToolParts(ctx, ctx.directory, input.sessionID)
-
-                output.parts.length = 0
-                output.parts.push({
-                    type: "text",
-                    text: `Compressor plugin pruned ${result.prunedCount} tool part(s) for session: ${input.sessionID}.`,
-                })
-                return
-            }
-
-            if (input.command !== COMPRESS_COMMAND) {
-                return
-            }
+            if (input.command !== COMPRESS_COMMAND) return
 
             const { rawParts, messages } = await collectRawParts(ctx, ctx.directory, input.sessionID)
             if (rawParts.length === 0) {
