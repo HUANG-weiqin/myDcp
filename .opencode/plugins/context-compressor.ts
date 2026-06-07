@@ -59,12 +59,15 @@ async function clientDELETE(client: any, directory: string, path: string): Promi
 }
 
 // ---------------------------------------------------------------------------
+/** Signature line at the start of every compressed summary for detection. */
+const COMPRESSED_PREFIX = "── Compressed ──\n\n"
+
 // Collect raw parts for compression (skip already compressed / pruned ones)
 // ---------------------------------------------------------------------------
 
 function isAlreadyHandled(part: Record<string, unknown>): boolean {
-    // New format: type field marks compressed parts directly
-    if (part.type === "compressed") return true
+    // New format: detect by prefix (no type change — API rejects unknown types)
+    if (part.type === "text" && typeof part.text === "string" && (part.text as string).startsWith(COMPRESSED_PREFIX)) return true
     // Legacy: check for old <<<MVP_COMPRESSED_CONTEXT>>> header markers
     return part.type === "text" && typeof part.text === "string" && (part.text as string).includes("<<<MVP_COMPRESSED_CONTEXT")
 }
@@ -112,7 +115,7 @@ async function writeCompressionSummary(
         }
     }
 
-    // Update anchor part: use dedicated type to avoid ugly markers in chat window
+    // Update anchor part: clean text with minimal prefix (no ugly markers, API-safe type)
     const anchorMsgID = partToMessage.get(anchor)
     if (anchorMsgID) {
         affectedMessages.delete(anchorMsgID)
@@ -120,8 +123,8 @@ async function writeCompressionSummary(
             id: anchor,
             sessionID,
             messageID: anchorMsgID,
-            type: "compressed",
-            text: summary.trim(),
+            type: "text",
+            text: COMPRESSED_PREFIX + summary.trim(),
             synthetic: false,
             ignored: false,
         })

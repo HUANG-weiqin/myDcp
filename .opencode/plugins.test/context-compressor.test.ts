@@ -217,11 +217,11 @@ describe("ContextCompressorPlugin", () => {
         expect(patches).toHaveLength(1)
         expect(deletes).toHaveLength(2)
 
-        // Anchor part gets the summary with dedicated type (no ugly markers)
+        // Anchor part gets the clean summary with minimal prefix
         const anchorPatch = patches[0]!
         expect(anchorPatch.url).toContain("prt_user")
-        expect((anchorPatch.body as any).type).toBe("compressed")
-        expect((anchorPatch.body as any).text).not.toContain("<<<MVP_COMPRESSED_CONTEXT")
+        expect((anchorPatch.body as any).type).toBe("text")
+        expect((anchorPatch.body as any).text).toContain("── Compressed ──")
         expect((anchorPatch.body as any).text).toContain("## Current Objective")
 
         // Remaining parts are deleted
