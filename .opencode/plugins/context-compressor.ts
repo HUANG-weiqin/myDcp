@@ -107,8 +107,12 @@ function isGlobTool(part: RawPart): boolean {
     return part.type === "tool" && part.tool === "glob"
 }
 
+function isEditTool(part: RawPart): boolean {
+    return part.type === "tool" && part.tool === "edit"
+}
+
 function isDirectReplaceTool(part: RawPart): boolean {
-    return isReadTool(part) || isGlobTool(part)
+    return isReadTool(part) || isGlobTool(part) || isEditTool(part)
 }
 
 function extractReadFilePath(input: unknown): string {
@@ -372,6 +376,27 @@ async function doCompression(
                 continue
             }
 
+            // Edit tool → direct replacement (action tool, compressing it is meaningless)
+            if (isEditTool(rawPart)) {
+                const path = extractReadFilePath(rawPart.input)
+                await clientPATCH(cl, directory,
+                    `/session/${sessionID}/message/${msgID}/part/${rawPart.partID}`,
+                    {
+                        id: rawPart.partID,
+                        sessionID,
+                        messageID: msgID,
+                        type: "text",
+                        text: `edit ${path}`,
+                        synthetic: false,
+                        ignored: false,
+                        metadata: { compressed: true },
+                    },
+                )
+                directReplacedCount++
+                compressedCount++
+                continue
+            }
+
             // Too few tokens (Compresser call overhead > savings) → keep original as-is
             if (estimateRawPartTokens(rawPart) < MIN_COMPRESS_TOKENS) {
                 skippedCount++
@@ -455,17 +480,24 @@ function collectPartsFromMessages(
 
     for (let i = 0; i < limit; i++) {
         const msg = messages[i]
-        if (msg.info.role === "user") continue  // user messages → preserve verbatim
 
         for (const part of msg.parts) {
             if (part.type === "step-start" || part.type === "step-finish") continue
             if (isAlreadyHandled(part)) continue
-            if ((part as any).synthetic) continue  // system-injected parts → preserve
 
-            if (part.type === "tool") {
-                const state = (part.state as Record<string, unknown>) ?? {}
-                if (state.status === "error") continue  // error tools → preserve error details verbatim
-            }
+            // Whitelist: only these part types enter the compression pipeline.
+            // Everything else (user messages, reasoning, synthetic, error tools, etc.) is left as-is.
+            const partTool = part.tool as string | undefined
+            const isDirectReplace = part.type === "tool" && (partTool === "read" || partTool === "glob" || partTool === "edit")
+            const isSynthetic = (part as any).synthetic === true
+            const partState = (part.state as Record<string, unknown>) ?? {}
+            const isError = partState.status === "error"
+
+            const allow = isDirectReplace
+                || (msg.info.role === "assistant" && part.type === "text" && !isSynthetic)
+                || (msg.info.role === "assistant" && part.type === "tool" && !isError)
+
+            if (!allow) continue
 
             const item: RawPart = {
                 partID: part.id as string,
@@ -474,7 +506,7 @@ function collectPartsFromMessages(
                 type: part.type as string,
             }
 
-            if (part.type === "text" || part.type === "reasoning") {
+            if (part.type === "text") {
                 item.text = typeof part.text === "string" ? part.text : ""
             }
 

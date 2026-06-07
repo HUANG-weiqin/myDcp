@@ -219,21 +219,21 @@ describe("ContextCompressorPlugin", () => {
             output,
         )
 
-        // 4 raw parts: prt_user (text), prt_reasoning (reasoning), prt_tool_read, prt_tool_bash
+        // 3 raw parts: prt_user (text), prt_tool_read, prt_tool_bash
         // prt_tool_read → direct replacement (0 session.prompt)
-        // prt_user, prt_reasoning, prt_tool_bash → 1 Compresser call each
+        // prt_user, prt_tool_bash → 1 Compresser call each
         // Boundary message → 1 session.prompt with noReply
         const sessionCalls = calls.filter((c) => c.method.startsWith("session."))
         expect(sessionCalls.map((c) => c.method)).toEqual([
             "session.messages", "session.create",
-            "session.prompt", "session.prompt", "session.prompt",
+            "session.prompt", "session.prompt",
             "session.prompt",  // boundary
             "session.delete",
         ])
 
-        // All 4 raw parts were PATCHed (not DELETEd)
+        // All 3 raw parts were PATCHed (not DELETEd)
         const patches = calls.filter((c) => c.method === "PATCH")
-        expect(patches).toHaveLength(4)
+        expect(patches).toHaveLength(3)
 
         // Read tool → direct "read {path}" replacement
         const readPatch = patches.find((p) => (p.body as any).text?.startsWith("read "))
@@ -243,7 +243,7 @@ describe("ContextCompressorPlugin", () => {
 
         // Other parts have Compresser-generated summaries with metadata.compressed
         const compressPatches = patches.filter((p) => !(p.body as any).text?.startsWith("read "))
-        expect(compressPatches).toHaveLength(3)
+        expect(compressPatches).toHaveLength(2)
         for (const p of compressPatches) {
             expect((p.body as any).type).toBe("text")
             expect((p.body as any).synthetic).toBe(false)
@@ -254,7 +254,7 @@ describe("ContextCompressorPlugin", () => {
         expect(calls.filter((c) => c.method === "DELETE")).toHaveLength(0)
 
         // Output message
-        expect(output.parts[0].text).toContain("processed 4 part(s)")
+        expect(output.parts[0].text).toContain("processed 3 part(s)")
         expect(output.parts[0].text).toContain("1 tools replaced directly")
     })
 
@@ -278,6 +278,11 @@ describe("ContextCompressorPlugin", () => {
                         tool: "read", callID: "c1",
                         state: { status: "completed", input: { filePath: "f.ts" }, output: "content" },
                     },
+                    {
+                        id: "prt_edit", sessionID: "ses_test", messageID: "msg_assistant", type: "tool",
+                        tool: "edit", callID: "c2",
+                        state: { status: "completed", input: { filePath: "src/main.ts" }, output: "" },
+                    },
                 ],
             },
         ]
@@ -291,13 +296,19 @@ describe("ContextCompressorPlugin", () => {
             output,
         )
 
-        // prt_short (skip) + prt_long (Compresser) + prt_read (direct) = 2 processed, 1 skipped
+        // prt_short (skip) + prt_long (Compresser) + prt_read (direct) + prt_edit (direct) = 3 processed, 1 skipped
         const patches = calls.filter((c) => c.method === "PATCH")
-        expect(patches).toHaveLength(2) // prt_long + prt_read
+        expect(patches).toHaveLength(3) // prt_long + prt_read + prt_edit
 
-        expect(output.parts[0].text).toContain("processed 2 part(s)")
-        expect(output.parts[0].text).toContain("1 tools replaced directly")
+        expect(output.parts[0].text).toContain("processed 3 part(s)")
+        expect(output.parts[0].text).toContain("2 tools replaced directly")
         expect(output.parts[0].text).toContain("1 too short skipped")
+
+        // Verify edit tool was direct-replaced
+        const editPatch = patches.find((p) => (p.body as any).text?.startsWith("edit "))
+        expect(editPatch).toBeDefined()
+        expect((editPatch!.body as any).text).toBe("edit src/main.ts")
+        expect((editPatch!.body as any).metadata?.compressed).toBe(true)
 
         // Verify boundary message was created with noReply
         const promptCalls = calls.filter((c) => c.method === "session.prompt")
@@ -309,6 +320,54 @@ describe("ContextCompressorPlugin", () => {
 
         // Output mentions boundary
         expect(output.parts[0].text).toContain("Boundary: msg_boundary")
+    })
+
+    it("whitelist excludes user, synthetic, reasoning, and error parts", async () => {
+        // Only assistant text (non-synthetic) and non-read/glob/edit tools should enter pipeline
+        const compressMessages = [
+            {
+                info: { id: "msg_user", sessionID: "ses_test", role: "user" },
+                parts: [
+                    { id: "prt_user_text", sessionID: "ses_test", messageID: "msg_user", type: "text", text: "The user wants compression implemented. ".repeat(10) },
+                ],
+            },
+            {
+                info: { id: "msg_assistant", sessionID: "ses_test", role: "assistant" },
+                parts: [
+                    { id: "prt_reasoning", sessionID: "ses_test", messageID: "msg_assistant", type: "reasoning", text: "The AI thinks carefully. ".repeat(10) },
+                    { id: "prt_synthetic", sessionID: "ses_test", messageID: "msg_assistant", type: "text", text: "<system-reminder>long instructions</system-reminder>".repeat(10), synthetic: true },
+                    { id: "prt_error_tool", sessionID: "ses_test", messageID: "msg_assistant", type: "tool", tool: "bash", callID: "c1", state: { status: "error", input: "ls", output: "ENOENT" } },
+                    { id: "prt_valid_text", sessionID: "ses_test", messageID: "msg_assistant", type: "text", text: "This is valid compressible content. ".repeat(23) },
+                ],
+            },
+        ]
+
+        const { client, calls } = mockRawClient({ messages: compressMessages })
+        const hooks = await ContextCompressorPlugin(mockPluginInput({ client }))
+        const output = { parts: [] as any[] }
+        await hooks["command.execute.before"]?.(
+            { command: "compress-all", sessionID: "ses_test", arguments: "" },
+            output,
+        )
+
+        // Only 1 part should be processed: prt_valid_text
+        const patches = calls.filter((c) => c.method === "PATCH")
+        expect(patches).toHaveLength(1)
+
+        const patchBody = patches[0].body as any
+        expect(patchBody.id).toBe("prt_valid_text")
+        expect(patchBody.type).toBe("text")
+        expect(patchBody.text).toBeTruthy()
+        expect(patchBody.metadata?.compressed).toBe(true)
+        expect(patchBody.synthetic).toBe(false)
+
+        // prt_user_text, prt_reasoning, prt_synthetic, prt_error_tool must NOT be patched
+        const patchedIDs = patches.map((p: any) => (p as any).body?.id ?? "")
+        expect(patchedIDs).not.toContain("prt_user_text")
+        expect(patchedIDs).not.toContain("prt_reasoning")
+        expect(patchedIDs).not.toContain("prt_synthetic")
+        expect(patchedIDs).not.toContain("prt_error_tool")
+        expect(patchedIDs).toContain("prt_valid_text")
     })
 
     // -----------------------------------------------------------------------
