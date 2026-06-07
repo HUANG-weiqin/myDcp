@@ -136,8 +136,8 @@ const MIN_COMPRESS_TOKENS = 200
 /** Tools that should NOT have their outputs compressed (always kept as-is). */
 const SKIP_OUTPUT_COMPRESS_TOOLS = new Set(["read", "glob", "edit", "skill", "grep"])
 
-/** Minimum raw text length for a tool output to trigger content-aware compression (~300 tokens). */
-const TOOL_OUTPUT_MIN_CHARS = 1200
+/** Minimum raw text length for a tool output to trigger content-aware compression (~100 tokens). */
+const TOOL_OUTPUT_MIN_CHARS = 400
 
 function isReadTool(part: RawPart): boolean {
     return part.type === "tool" && part.tool === "read"
