@@ -365,7 +365,7 @@ describe("MvpContextPlugin", () => {
     })
 
     it("auto-compresses oldest messages when tokens exceed threshold", async () => {
-        // Build 12 messages, each with ~1667 tokens of text → total ~20000 tokens > 16384
+        // Build 12 messages, each with ~1750 tokens of text → total ~21000 tokens > 16384
         const MANY_MESSAGES = Array.from({ length: 12 }, (_, i) => ({
             info: { id: `msg_${i}`, sessionID: "ses_test", role: i % 2 === 0 ? "user" : "assistant" },
             parts: [
@@ -374,7 +374,7 @@ describe("MvpContextPlugin", () => {
                     sessionID: "ses_test",
                     messageID: `msg_${i}`,
                     type: "text",
-                    text: "A".repeat(5000),
+                    text: "A".repeat(7000),
                 },
             ],
         }))
@@ -383,10 +383,14 @@ describe("MvpContextPlugin", () => {
 
         const hooks = await MvpContextPlugin(mockPluginInput({ client }))
 
+        // Hook fires async — compression runs in background
         await hooks["chat.message"]?.(
             { sessionID: "ses_test", messageID: "msg_new" } as any,
             { message: { role: "user" } } as any,
         )
+
+        // Wait for async compression to complete
+        await new Promise((r) => setTimeout(r, 0))
 
         // Should have triggered compression
         // 12 msgs, protected ≈ 5 (msg_7..msg_11), compressible ≈ 7 (msg_0..msg_6)
@@ -398,5 +402,44 @@ describe("MvpContextPlugin", () => {
         expect(
             deletes.filter((d) => d.url.includes("/part/")).length,
         ).toBeGreaterThanOrEqual(6)
+    })
+
+    it("skips auto-compress when compression is already in progress for the same session", async () => {
+        const MANY_MESSAGES = Array.from({ length: 12 }, (_, i) => ({
+            info: { id: `msg_${i}`, sessionID: "ses_test", role: i % 2 === 0 ? "user" : "assistant" },
+            parts: [
+                {
+                    id: `prt_${i}`,
+                    sessionID: "ses_test",
+                    messageID: `msg_${i}`,
+                    type: "text",
+                    text: "A".repeat(7000),
+                },
+            ],
+        }))
+
+        const { client, calls } = mockRawClient({ messages: MANY_MESSAGES })
+
+        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
+
+        // First call fires compression (async)
+        await hooks["chat.message"]?.(
+            { sessionID: "ses_test", messageID: "msg_new" } as any,
+            { message: { role: "user" } } as any,
+        )
+
+        // Second call should be skipped (compression in progress)
+        const callCountBefore = calls.length
+        await hooks["chat.message"]?.(
+            { sessionID: "ses_test", messageID: "msg_new2" } as any,
+            { message: { role: "user" } } as any,
+        )
+
+        // No additional session.create calls (second hook was skipped)
+        const createCalls = calls.filter((c) => c.method === "session.create")
+        expect(createCalls).toHaveLength(1)
+
+        // Wait for first compression to finish before test cleanup
+        await new Promise((r) => setTimeout(r, 0))
     })
 })
