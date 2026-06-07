@@ -475,7 +475,7 @@ function collectPartsFromMessages(
 
             const allow = isDirectReplace
                 || (msg.info.role === "assistant" && part.type === "text" && !isSynthetic)
-                || (msg.info.role === "assistant" && part.type === "tool" && !isError && partTool !== "edit")
+                || (msg.info.role === "assistant" && part.type === "tool" && !isError && partTool !== "edit" && partTool !== "skill")
 
             if (!allow) continue
 
