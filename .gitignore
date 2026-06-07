@@ -1,0 +1,19 @@
+# Research/source clones used for inspection only.
+opencode-source/
+opencode-dynamic-context-pruning/
+
+# Dependencies and package manager artifacts.
+node_modules/
+package-lock.json
+bun.lock
+
+# Logs and temporary files.
+*.log
+*.tmp
+*.temp
+
+# OS/editor noise.
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
