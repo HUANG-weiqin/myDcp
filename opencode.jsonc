@@ -1,0 +1,8 @@
+{
+    "plugin": [
+        ["mvp-context", {
+            "agentContextWindow": 50000,
+            "compressTriggerMultiple": 1.5
+        }]
+    ]
+}

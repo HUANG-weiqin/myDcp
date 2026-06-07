@@ -100,41 +100,13 @@ async function collectRawParts(
     rc: any,
     directory: string,
     sessionID: string,
+    maxMessages?: number,
 ): Promise<{ rawParts: RawPart[]; messages: Array<{ info: { id: string }; parts: Array<Record<string, unknown>> }> }> {
     const messages: Array<{ info: { id: string; role: string }; parts: Array<Record<string, unknown>> }> = await rc.client.session
         .messages({ path: { id: sessionID }, query: { directory } })
         .then((r: any) => r?.data ?? r)
 
-    const rawParts: RawPart[] = []
-
-    for (const msg of messages) {
-        for (const part of msg.parts) {
-            if (part.type === "step-start" || part.type === "step-finish") continue
-            if (isAlreadyHandled(part)) continue
-
-            const item: RawPart = {
-                partID: part.id as string,
-                messageID: msg.info.id,
-                role: msg.info.role,
-                type: part.type as string,
-            }
-
-            if (part.type === "text" || part.type === "reasoning") {
-                item.text = typeof part.text === "string" ? part.text : ""
-            }
-
-            if (part.type === "tool") {
-                const state = (part.state as Record<string, unknown>) ?? {}
-                item.tool = part.tool as string
-                item.callID = part.callID as string
-                item.status = state.status as string
-                item.input = state.input
-                item.output = typeof state.output === "string" ? state.output : ""
-            }
-
-            rawParts.push(item)
-        }
-    }
+    const rawParts = collectPartsFromMessages(messages, maxMessages)
 
     return { rawParts, messages }
 }
@@ -279,11 +251,171 @@ function responseText(response: any): string {
     return text
 }
 
+// ===== Auto-trigger configuration =====
+
+interface MvpPluginConfig {
+    agentContextWindow?: number
+    compressTriggerMultiple?: number
+}
+
+const CONFIG_DEFAULTS = {
+    agentContextWindow: 8192,
+    compressTriggerMultiple: 2.0,
+} as const
+
+const MIN_WINDOW_TOKENS = 1024
+const MIN_MULTIPLE = 1.5
+const MESSAGE_FLOOR = 5
+const COMPRESS_COOLDOWN = 5
+
+// ===== Token estimation (rough: ~1 token per 3 chars for mixed content) =====
+
+function estimateTokenCount(text: string): number {
+    if (!text) return 0
+    return Math.ceil(text.length / 3)
+}
+
+function estimatePartTokens(part: Record<string, unknown>): number {
+    if (part.type === "text" || part.type === "reasoning") {
+        return estimateTokenCount(typeof part.text === "string" ? part.text : "")
+    }
+    if (part.type === "tool") {
+        const state = (part.state as Record<string, unknown>) ?? {}
+        const input = JSON.stringify(state.input ?? "")
+        const output = typeof state.output === "string" ? state.output : ""
+        return estimateTokenCount(input) + estimateTokenCount(output)
+    }
+    return 0
+}
+
+/** How many of the most recent messages should be protected from compression. */
+function computeProtectedCount(
+    messages: Array<{ info: { role: string }; parts: Array<Record<string, unknown>> }>,
+    tokenBudget: number,
+    messageFloor: number,
+): number {
+    let accumulated = 0
+    let protectedCount = 0
+
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i]
+        protectedCount++
+
+        for (const part of msg.parts) {
+            if (part.type === "step-start" || part.type === "step-finish") continue
+            if (isAlreadyHandled(part)) continue
+            accumulated += estimatePartTokens(part)
+        }
+
+        if (protectedCount >= messageFloor && accumulated >= tokenBudget) break
+    }
+
+    return Math.min(protectedCount, messages.length)
+}
+
+// ===== Extracted compression logic (shared between manual and auto) =====
+
+async function doCompression(
+    ctx: { client: any; directory: string },
+    directory: string,
+    sessionID: string,
+    rawParts: RawPart[],
+    messages: Array<{ info: { id: string }; parts: Array<Record<string, unknown>> }>,
+): Promise<{ compressedCount: number; anchorPartID: string; deletedMessages: number }> {
+    const created = responseData(
+        await ctx.client.session.create({
+            body: { title: `MVP compression scratch for ${sessionID}` },
+            query: { directory },
+        }),
+    )
+    const tempSessionID = created.id
+
+    try {
+        const summary = responseText(
+            await ctx.client.session.prompt({
+                path: { id: tempSessionID },
+                body: {
+                    agent: COMPRESS_AGENT,
+                    parts: [{ type: "text", text: buildCompressionPrompt(rawParts) }],
+                },
+                query: { directory },
+            }),
+        )
+        return await writeCompressionSummary(
+            ctx,
+            directory,
+            sessionID,
+            rawParts.map((p) => p.partID),
+            summary,
+            messages,
+        )
+    } finally {
+        await ctx.client.session.delete({ path: { id: tempSessionID } })
+    }
+}
+
+// ===== Shared part extraction (works on pre-fetched messages, avoids re-fetch) =====
+
+function collectPartsFromMessages(
+    messages: Array<{ info: { id: string; role: string }; parts: Array<Record<string, unknown>> }>,
+    maxMessages?: number,
+): RawPart[] {
+    const rawParts: RawPart[] = []
+    const limit = maxMessages != null ? Math.min(maxMessages, messages.length) : messages.length
+
+    for (let i = 0; i < limit; i++) {
+        const msg = messages[i]
+        for (const part of msg.parts) {
+            if (part.type === "step-start" || part.type === "step-finish") continue
+            if (isAlreadyHandled(part)) continue
+
+            const item: RawPart = {
+                partID: part.id as string,
+                messageID: msg.info.id,
+                role: msg.info.role,
+                type: part.type as string,
+            }
+
+            if (part.type === "text" || part.type === "reasoning") {
+                item.text = typeof part.text === "string" ? part.text : ""
+            }
+
+            if (part.type === "tool") {
+                const state = (part.state as Record<string, unknown>) ?? {}
+                item.tool = part.tool as string
+                item.callID = part.callID as string
+                item.status = state.status as string
+                item.input = state.input
+                item.output = typeof state.output === "string" ? state.output : ""
+            }
+
+            rawParts.push(item)
+        }
+    }
+
+    return rawParts
+}
+
 // ---------------------------------------------------------------------------
 // Plugin entry point
 // ---------------------------------------------------------------------------
 
-export const MvpContextPlugin: Plugin = async (ctx) => {
+export const MvpContextPlugin: Plugin = async (ctx, options) => {
+    const pluginConfig: MvpPluginConfig = {
+        ...CONFIG_DEFAULTS,
+        ...(options as MvpPluginConfig | undefined),
+    }
+    const windowTokens = Math.max(
+        pluginConfig.agentContextWindow ?? CONFIG_DEFAULTS.agentContextWindow,
+        MIN_WINDOW_TOKENS,
+    )
+    const triggerMultiple = Math.max(
+        pluginConfig.compressTriggerMultiple ?? CONFIG_DEFAULTS.compressTriggerMultiple,
+        MIN_MULTIPLE,
+    )
+
+    let lastCompressedMsgCount = 0
+
     return {
         config: async (config) => {
             config.command ??= {}
@@ -294,6 +426,51 @@ export const MvpContextPlugin: Plugin = async (ctx) => {
             config.command[COMPRESS_COMMAND] = {
                 template: "",
                 description: "MVP: compress current-session raw parts with the Compresser agent",
+            }
+        },
+
+        "chat.message": async (input) => {
+            if (!input.sessionID || !input.messageID) return
+
+            const messages: Array<{ info: { id: string; role: string }; parts: Array<Record<string, unknown>> }> =
+                await ctx.client.session
+                    .messages({ path: { id: input.sessionID }, query: { directory: ctx.directory } })
+                    .then((r: any) => r?.data ?? r)
+
+            // Count total raw tokens across all messages
+            let totalRawTokens = 0
+            for (const msg of messages) {
+                for (const part of msg.parts) {
+                    if (part.type === "step-start" || part.type === "step-finish") continue
+                    if (isAlreadyHandled(part)) continue
+                    totalRawTokens += estimatePartTokens(part)
+                }
+            }
+
+            // Check threshold: trigger when total > window × multiple
+            const threshold = Math.floor(windowTokens * triggerMultiple)
+            if (totalRawTokens <= threshold) return
+
+            // Cooldown: skip if we just compressed
+            if (messages.length - lastCompressedMsgCount < COMPRESS_COOLDOWN) return
+
+            // Determine how many of the most recent messages to protect
+            const protectedCount = computeProtectedCount(messages, windowTokens, MESSAGE_FLOOR)
+            const compressibleCount = messages.length - protectedCount
+            if (compressibleCount <= 0) return
+
+            // Collect parts from the oldest (compressible) messages only
+            const rawParts = collectPartsFromMessages(messages, compressibleCount)
+            if (rawParts.length === 0) return
+
+            try {
+                const result = await doCompression(ctx, ctx.directory, input.sessionID, rawParts, messages)
+                lastCompressedMsgCount = messages.length
+                console.log(
+                    `[MVP] Auto-compressed ${result.compressedCount} part(s), deleted ${result.deletedMessages} message(s)`,
+                )
+            } catch (err) {
+                console.error("[MVP] Auto-compression failed:", err)
             }
         },
 
@@ -320,42 +497,13 @@ export const MvpContextPlugin: Plugin = async (ctx) => {
                 return
             }
 
-            const created = responseData(
-                await ctx.client.session.create({
-                    body: { title: `MVP compression scratch for ${input.sessionID}` },
-                    query: { directory: ctx.directory },
-                }),
-            )
-            const tempSessionID = created.id
+            const result = await doCompression(ctx, ctx.directory, input.sessionID, rawParts, messages)
 
-            try {
-                const summary = responseText(
-                    await ctx.client.session.prompt({
-                        path: { id: tempSessionID },
-                        body: {
-                            agent: COMPRESS_AGENT,
-                            parts: [{ type: "text", text: buildCompressionPrompt(rawParts) }],
-                        },
-                        query: { directory: ctx.directory },
-                    }),
-                )
-                const result = await writeCompressionSummary(
-                    ctx,
-                    ctx.directory,
-                    input.sessionID,
-                    rawParts.map((part) => part.partID),
-                    summary,
-                    messages,
-                )
-
-                output.parts.length = 0
-                output.parts.push({
-                    type: "text",
-                    text: `MVP context plugin compressed ${result.compressedCount} raw part(s), deleted ${result.deletedMessages} empty message(s) for session: ${input.sessionID}. Anchor: ${result.anchorPartID}.`,
-                })
-            } finally {
-                await ctx.client.session.delete({ path: { id: tempSessionID } })
-            }
+            output.parts.length = 0
+            output.parts.push({
+                type: "text",
+                text: `MVP context plugin compressed ${result.compressedCount} raw part(s), deleted ${result.deletedMessages} empty message(s) for session: ${input.sessionID}. Anchor: ${result.anchorPartID}.`,
+            })
         },
     }
 }

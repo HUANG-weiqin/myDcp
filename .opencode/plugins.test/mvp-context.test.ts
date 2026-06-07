@@ -333,4 +333,70 @@ describe("MvpContextPlugin", () => {
         expect(msgDeletes).toHaveLength(1)
         expect(msgDeletes[0].url).toContain("/message/msg_assistant")
     })
+
+    // -----------------------------------------------------------------------
+    // chat.message hook (auto-trigger)
+    // -----------------------------------------------------------------------
+
+    it("registers a chat.message hook", async () => {
+        const hooks = await MvpContextPlugin(mockPluginInput())
+        expect(hooks["chat.message"]).toBeDefined()
+    })
+
+    it("does not auto-compress when total tokens are below threshold", async () => {
+        const { client, calls } = mockRawClient({ messages: SAMPLE_MESSAGES })
+
+        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
+
+        // chat.message fires with no sessionID → should early-return
+        await hooks["chat.message"]?.({} as any, {} as any)
+        expect(calls.filter((c) => c.method === "PATCH" || c.method === "DELETE")).toHaveLength(0)
+
+        // chat.message fires with sessionID but tokens below threshold → should NOT compress
+        await hooks["chat.message"]?.(
+            { sessionID: "ses_test", messageID: "msg_new" } as any,
+            { message: { role: "user" } } as any,
+        )
+        const patches = calls.filter((c) => c.method === "PATCH")
+        const deletes = calls.filter((c) => c.method === "DELETE")
+        // SAMPLE_MESSAGES has ~50 tokens total, far below 8192*2=16384 threshold
+        expect(patches).toHaveLength(0)
+        expect(deletes).toHaveLength(0)
+    })
+
+    it("auto-compresses oldest messages when tokens exceed threshold", async () => {
+        // Build 12 messages, each with ~1667 tokens of text → total ~20000 tokens > 16384
+        const MANY_MESSAGES = Array.from({ length: 12 }, (_, i) => ({
+            info: { id: `msg_${i}`, sessionID: "ses_test", role: i % 2 === 0 ? "user" : "assistant" },
+            parts: [
+                {
+                    id: `prt_${i}`,
+                    sessionID: "ses_test",
+                    messageID: `msg_${i}`,
+                    type: "text",
+                    text: "A".repeat(5000),
+                },
+            ],
+        }))
+
+        const { client, calls } = mockRawClient({ messages: MANY_MESSAGES })
+
+        const hooks = await MvpContextPlugin(mockPluginInput({ client }))
+
+        await hooks["chat.message"]?.(
+            { sessionID: "ses_test", messageID: "msg_new" } as any,
+            { message: { role: "user" } } as any,
+        )
+
+        // Should have triggered compression
+        // 12 msgs, protected ≈ 5 (msg_7..msg_11), compressible ≈ 7 (msg_0..msg_6)
+        // → 1 PATCH (anchor prt_0) + 6 part DELETE + 7 msg DELETE (empty after single part removed)
+        const patches = calls.filter((c) => c.method === "PATCH")
+        const deletes = calls.filter((c) => c.method === "DELETE")
+
+        expect(patches.length).toBeGreaterThanOrEqual(1)
+        expect(
+            deletes.filter((d) => d.url.includes("/part/")).length,
+        ).toBeGreaterThanOrEqual(6)
+    })
 })
