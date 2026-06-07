@@ -44,8 +44,10 @@ function mockRawClient(withSession?: Record<string, any>) {
         }),
         prompt: withSession?.prompt ?? (async (options: any) => {
             record("session.prompt", options)
+            const isBoundary = options?.body?.noReply === true
             return {
                 data: {
+                    info: isBoundary ? { id: "msg_boundary" } : undefined,
                     parts: [{ type: "text", text: "## Current Objective\n- Test.\n\n## Next Action\n- Done." }],
                 },
             }
@@ -152,12 +154,13 @@ describe("ContextCompressorPlugin", () => {
         expect(output.parts).toEqual([{ type: "text", text: "unchanged" }])
     })
 
-    it("compresses raw current-session parts with Compresser and deletes consumed parts", async () => {
+    it("compresses each raw part individually with per-part summarization (no deletes)", async () => {
+        // Each raw part is long enough (>80 chars) to trigger Compresser, except read tool which is direct
         const compressMessages = [
             {
                 info: { id: "msg_user", sessionID: "ses_test", role: "user" },
                 parts: [
-                    { id: "prt_user", sessionID: "ses_test", messageID: "msg_user", type: "text", text: "User wants destructive compression. 👋" },
+                    { id: "prt_user", sessionID: "ses_test", messageID: "msg_user", type: "text", text: "The user wants to implement a high-fidelity compression mode that processes each message individually. ".repeat(3) },
                 ],
             },
             {
@@ -168,16 +171,25 @@ describe("ContextCompressorPlugin", () => {
                         sessionID: "ses_test",
                         messageID: "msg_assistant",
                         type: "reasoning",
-                        text: "Direct DB modification works because OpenCode reloads SQLite each loop.",
+                        text: "The AI assistant thinks about the best approach for implementing this feature. It considers several design options and trade-offs. ".repeat(3),
                     },
                     {
-                        id: "prt_tool",
+                        id: "prt_tool_read",
                         sessionID: "ses_test",
                         messageID: "msg_assistant",
                         type: "tool",
                         tool: "read",
                         callID: "call_1",
-                        state: { status: "completed", input: { filePath: "a.ts" }, output: "large output" },
+                        state: { status: "completed", input: { filePath: "src/main.ts" }, output: "large file contents here" },
+                    },
+                    {
+                        id: "prt_tool_bash",
+                        sessionID: "ses_test",
+                        messageID: "msg_assistant",
+                        type: "tool",
+                        tool: "bash",
+                        callID: "call_2",
+                        state: { status: "completed", input: { command: "npm test" }, output: "Test results: 42 passed, 0 failed. All tests completed successfully. ".repeat(4) },
                     },
                     {
                         id: "prt_existing_summary",
@@ -191,7 +203,7 @@ describe("ContextCompressorPlugin", () => {
                         sessionID: "ses_test",
                         messageID: "msg_assistant",
                         type: "text",
-                        text: "## Current Objective\nprev summary",
+                        text: "this is already compressed",
                         metadata: { compressed: true },
                     },
                 ],
@@ -207,66 +219,64 @@ describe("ContextCompressorPlugin", () => {
             output,
         )
 
-        // Verify prompt was built correctly
-        const promptCall = calls.find((c) => c.method === "session.prompt")
-        expect(promptCall).toBeDefined()
-
-        // Verify create → prompt → delete sequence
+        // 4 raw parts: prt_user (text), prt_reasoning (reasoning), prt_tool_read, prt_tool_bash
+        // prt_tool_read → direct replacement (0 session.prompt)
+        // prt_user, prt_reasoning, prt_tool_bash → 1 Compresser call each
+        // Boundary message → 1 session.prompt with noReply
         const sessionCalls = calls.filter((c) => c.method.startsWith("session."))
-        expect(sessionCalls.map((c) => c.method)).toEqual(["session.messages", "session.create", "session.prompt", "session.delete"])
+        expect(sessionCalls.map((c) => c.method)).toEqual([
+            "session.messages", "session.create",
+            "session.prompt", "session.prompt", "session.prompt",
+            "session.prompt",  // boundary
+            "session.delete",
+        ])
 
-        // Verify the output message
-        expect(output.parts[0].text).toContain("compressed 3 raw part(s), deleted 0 empty message(s)")
-
-        // Verify: 1 PATCH (anchor) + 2 DELETE (remaining parts)
+        // All 4 raw parts were PATCHed (not DELETEd)
         const patches = calls.filter((c) => c.method === "PATCH")
-        const deletes = calls.filter((c) => c.method === "DELETE")
+        expect(patches).toHaveLength(4)
 
-        expect(patches).toHaveLength(1)
-        expect(deletes).toHaveLength(2)
+        // Read tool → direct "read {path}" replacement
+        const readPatch = patches.find((p) => (p.body as any).text?.startsWith("read "))
+        expect(readPatch).toBeDefined()
+        expect((readPatch!.body as any).text).toBe("read src/main.ts")
+        expect((readPatch!.body as any).metadata?.compressed).toBe(true)
 
-        // Anchor part stores summary as text with metadata.compressed flag
-        const anchorPatch = patches[0]!
-        expect(anchorPatch.url).toContain("prt_user")
-        expect((anchorPatch.body as any).type).toBe("text")
-        expect((anchorPatch.body as any).synthetic).toBe(false)
-        expect((anchorPatch.body as any).metadata?.compressed).toBe(true)
-        expect((anchorPatch.body as any).text).toContain("## Current Objective")
+        // Other parts have Compresser-generated summaries with metadata.compressed
+        const compressPatches = patches.filter((p) => !(p.body as any).text?.startsWith("read "))
+        expect(compressPatches).toHaveLength(3)
+        for (const p of compressPatches) {
+            expect((p.body as any).type).toBe("text")
+            expect((p.body as any).synthetic).toBe(false)
+            expect((p.body as any).metadata?.compressed).toBe(true)
+        }
 
-        // Remaining parts are deleted
-        expect(deletes.some((d) => d.url.includes("prt_reasoning"))).toBe(true)
-        expect(deletes.some((d) => d.url.includes("prt_tool"))).toBe(true)
-        // No message-level deletes — msg_assistant still has prt_existing_summary
-        expect(deletes.every((d) => d.url.includes("/part/"))).toBe(true)
+        // No DELETEs in the new mode
+        expect(calls.filter((c) => c.method === "DELETE")).toHaveLength(0)
+
+        // Output message
+        expect(output.parts[0].text).toContain("processed 4 part(s)")
+        expect(output.parts[0].text).toContain("1 read tools replaced directly")
     })
 
-    it("deletes empty messages after compression", async () => {
-        // msg_assistant has only the two parts being compressed — no leftovers
+    it("skips short parts and creates boundary message", async () => {
         const compressMessages = [
             {
                 info: { id: "msg_user", sessionID: "ses_test", role: "user" },
                 parts: [
-                    { id: "prt_user", sessionID: "ses_test", messageID: "msg_user", type: "text", text: "Goal: test" },
+                    { id: "prt_short", sessionID: "ses_test", messageID: "msg_user", type: "text", text: "Hi" }, // < 80 chars → skip
                 ],
             },
             {
-                info: { id: "msg_assistant", sessionID: "ses_test", role: "assistant", tokens: { output: 8, reasoning: 4 } },
+                info: { id: "msg_assistant", sessionID: "ses_test", role: "assistant" },
                 parts: [
                     {
-                        id: "prt_reasoning",
-                        sessionID: "ses_test",
-                        messageID: "msg_assistant",
-                        type: "reasoning",
-                        text: "some reasoning",
+                        id: "prt_long", sessionID: "ses_test", messageID: "msg_assistant", type: "text",
+                        text: "X".repeat(200), // > 80 chars → Compresser
                     },
                     {
-                        id: "prt_tool",
-                        sessionID: "ses_test",
-                        messageID: "msg_assistant",
-                        type: "tool",
-                        tool: "bash",
-                        callID: "call_1",
-                        state: { status: "completed", input: { command: "pwd" }, output: "/home" },
+                        id: "prt_read", sessionID: "ses_test", messageID: "msg_assistant", type: "tool",
+                        tool: "read", callID: "c1",
+                        state: { status: "completed", input: { filePath: "f.ts" }, output: "content" },
                     },
                 ],
             },
@@ -281,21 +291,24 @@ describe("ContextCompressorPlugin", () => {
             output,
         )
 
-        expect(output.parts[0].text).toContain("compressed 3 raw part(s), deleted 1 empty message(s)")
-
-        // 1 PATCH (anchor) + 2 DELETE (parts) + 1 DELETE (empty message)
+        // prt_short (skip) + prt_long (Compresser) + prt_read (direct) = 2 processed, 1 skipped
         const patches = calls.filter((c) => c.method === "PATCH")
-        const deletes = calls.filter((c) => c.method === "DELETE")
+        expect(patches).toHaveLength(2) // prt_long + prt_read
 
-        expect(patches).toHaveLength(1)
-        expect(deletes).toHaveLength(3)
+        expect(output.parts[0].text).toContain("processed 2 part(s)")
+        expect(output.parts[0].text).toContain("1 read tools replaced directly")
+        expect(output.parts[0].text).toContain("1 too short skipped")
 
-        const partDeletes = deletes.filter((d) => d.url.includes("/part/"))
-        const msgDeletes = deletes.filter((d) => !d.url.includes("/part/"))
+        // Verify boundary message was created with noReply
+        const promptCalls = calls.filter((c) => c.method === "session.prompt")
+        expect(promptCalls).toHaveLength(2) // 1 (prt_long) + 1 (boundary)
 
-        expect(partDeletes).toHaveLength(2)
-        expect(msgDeletes).toHaveLength(1)
-        expect(msgDeletes[0].url).toContain("/message/msg_assistant")
+        const boundaryCall = promptCalls[1]
+        expect(boundaryCall.url).toContain('"noReply":true')
+        expect(boundaryCall.url).toContain('"compressionBoundary":true')
+
+        // Output mentions boundary
+        expect(output.parts[0].text).toContain("Boundary: msg_boundary")
     })
 
     // -----------------------------------------------------------------------
@@ -369,16 +382,14 @@ describe("ContextCompressorPlugin", () => {
         // Wait for async compression to complete
         await new Promise((r) => setTimeout(r, 0))
 
-        // Should have triggered compression
+        // Should have triggered per-part compression
         // 12 msgs, protected ≈ 5 (msg_7..msg_11), compressible ≈ 7 (msg_0..msg_6)
-        // → 1 PATCH (anchor prt_0) + 6 part DELETE + 7 msg DELETE (empty after single part removed)
+        // Each compressible part → 1 PATCH (no DELETEs in high-fidelity mode)
         const patches = calls.filter((c) => c.method === "PATCH")
         const deletes = calls.filter((c) => c.method === "DELETE")
 
-        expect(patches.length).toBeGreaterThanOrEqual(1)
-        expect(
-            deletes.filter((d) => d.url.includes("/part/")).length,
-        ).toBeGreaterThanOrEqual(6)
+        expect(patches.length).toBeGreaterThanOrEqual(7)
+        expect(deletes).toHaveLength(0)
     })
 
     it("skips auto-compress when compression is already in progress for the same session", async () => {
