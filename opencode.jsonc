@@ -1,7 +1,6 @@
 {
-  "$schema": "https://opencode.ai/config.json",
     "plugin": [
-        ["context-compressor", {
+        ["./.opencode/plugins/context-compressor.ts", {
             "agentContextWindow": 80000,
             "compressTriggerMultiple": 1.5
         }]

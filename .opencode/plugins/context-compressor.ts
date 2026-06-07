@@ -58,16 +58,11 @@ async function clientDELETE(client: any, directory: string, path: string): Promi
     if (result.error) throw new Error(`DELETE ${path} failed: ${JSON.stringify(result.error)}`)
 }
 
-// ---------------------------------------------------------------------------
-/** Signature line at the start of every compressed summary for detection. */
-const COMPRESSED_PREFIX = "── Compressed ──\n\n"
-
-// Collect raw parts for compression (skip already compressed / pruned ones)
-// ---------------------------------------------------------------------------
-
 function isAlreadyHandled(part: Record<string, unknown>): boolean {
-    // New format: detect by prefix (no type change — API rejects unknown types)
-    if (part.type === "text" && typeof part.text === "string" && (part.text as string).startsWith(COMPRESSED_PREFIX)) return true
+    // Current format: text part with metadata.compressed = summary anchor (visible to agent, detectable by metadata)
+    if (part.type === "text" && typeof part.metadata === "object" && part.metadata !== null && (part.metadata as Record<string, unknown>).compressed === true) return true
+    // Legacy: brief period where compressed parts had type="compressed"
+    if (part.type === "compressed") return true
     // Legacy: check for old <<<MVP_COMPRESSED_CONTEXT>>> header markers
     return part.type === "text" && typeof part.text === "string" && (part.text as string).includes("<<<MVP_COMPRESSED_CONTEXT")
 }
@@ -115,7 +110,9 @@ async function writeCompressionSummary(
         }
     }
 
-    // Update anchor part: clean text with minimal prefix (no ugly markers, API-safe type)
+    // Update anchor part: store summary as text with metadata.compressed flag
+    // The text is visible to the main agent (provides context continuity) and the user (clean Markdown).
+    // metadata.compressed = true is used by isAlreadyHandled to avoid re-compression.
     const anchorMsgID = partToMessage.get(anchor)
     if (anchorMsgID) {
         affectedMessages.delete(anchorMsgID)
@@ -124,9 +121,10 @@ async function writeCompressionSummary(
             sessionID,
             messageID: anchorMsgID,
             type: "text",
-            text: COMPRESSED_PREFIX + summary.trim(),
+            text: summary.trim(),
             synthetic: false,
             ignored: false,
+            metadata: { compressed: true },
         })
     }
 

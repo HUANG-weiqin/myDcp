@@ -186,6 +186,14 @@ describe("ContextCompressorPlugin", () => {
                         type: "text",
                         text: "<<<MVP_COMPRESSED_CONTEXT v1>>>\nold summary\n<<<END_MVP_COMPRESSED_CONTEXT>>>",
                     },
+                    {
+                        id: "prt_metadata_compressed",
+                        sessionID: "ses_test",
+                        messageID: "msg_assistant",
+                        type: "text",
+                        text: "## Current Objective\nprev summary",
+                        metadata: { compressed: true },
+                    },
                 ],
             },
         ]
@@ -217,11 +225,12 @@ describe("ContextCompressorPlugin", () => {
         expect(patches).toHaveLength(1)
         expect(deletes).toHaveLength(2)
 
-        // Anchor part gets the clean summary with minimal prefix
+        // Anchor part stores summary as text with metadata.compressed flag
         const anchorPatch = patches[0]!
         expect(anchorPatch.url).toContain("prt_user")
         expect((anchorPatch.body as any).type).toBe("text")
-        expect((anchorPatch.body as any).text).toContain("── Compressed ──")
+        expect((anchorPatch.body as any).synthetic).toBe(false)
+        expect((anchorPatch.body as any).metadata?.compressed).toBe(true)
         expect((anchorPatch.body as any).text).toContain("## Current Objective")
 
         // Remaining parts are deleted
