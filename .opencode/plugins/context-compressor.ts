@@ -409,6 +409,29 @@ async function doCompression(
             compressedCount++
         }
 
+        // Shrink old boundary messages to a single-line marker.
+        // They pile up after multiple compression cycles and waste context window space.
+        for (const msg of messages) {
+            for (const part of msg.parts) {
+                const meta = (part.metadata as Record<string, unknown>) ?? {}
+                if (meta.compressionBoundary !== true) continue
+                if (typeof part.id !== "string" || typeof msg.info.id !== "string") continue
+                pendingPatches.push({
+                    path: `/session/${sessionID}/message/${msg.info.id}/part/${part.id}`,
+                    body: {
+                        id: part.id,
+                        sessionID,
+                        messageID: msg.info.id,
+                        type: "text",
+                        text: "[Previous compression boundary]",
+                        synthetic: false,
+                        ignored: false,
+                        metadata: { compressed: true, compressionBoundary: true },
+                    },
+                })
+            }
+        }
+
         // Flush all queued patches atomically — single cache invalidation
         for (const p of pendingPatches) {
             await clientPATCH(cl, directory, p.path, p.body)
