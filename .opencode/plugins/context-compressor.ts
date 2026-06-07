@@ -131,11 +131,6 @@ function estimateRawPartTokens(part: RawPart): number {
 
 function buildSinglePartPrompt(part: RawPart): string {
     return [
-        "Concisely summarize this piece of conversation history for task continuity.",
-        "Preserve key facts, decisions, code references, file paths, errors, and user constraints.",
-        "Drop fluff, repeated explanations, and verbose tool output.",
-        "Return only the summary, no preamble.",
-        "",
         "=== CONTENT ===",
         formatRawPart(part),
         "=== END ===",
