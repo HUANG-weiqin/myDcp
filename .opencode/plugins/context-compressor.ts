@@ -311,7 +311,7 @@ async function doCompression(
     sessionID: string,
     rawParts: RawPart[],
     messages: Array<{ info: { id: string }; parts: Array<Record<string, unknown>> }>,
-): Promise<{ compressedCount: number; directReplacedCount: number; skippedCount: number; boundaryMsgID: string }> {
+): Promise<{ compressedCount: number; directReplacedCount: number; skippedCount: number }> {
     // Build partID → messageID lookup
     const partToMessage = new Map<string, string>()
     for (const msg of messages) {
@@ -324,7 +324,7 @@ async function doCompression(
     let compressedCount = 0
     let directReplacedCount = 0
     let skippedCount = 0
-    let boundaryMsgID = ""
+    let lastPatch: { path: string; body: any } | null = null
 
     // Collect all PATCH operations in a buffer, apply in batch at the end.
     // This avoids the main agent seeing individual parts being modified
@@ -356,7 +356,7 @@ async function doCompression(
                     label = "glob"
                     text = extractGlobPattern(rawPart.input)
                 }
-                pendingPatches.push({
+                const drPatch = {
                     path: `/session/${sessionID}/message/${msgID}/part/${rawPart.partID}`,
                     body: {
                         id: rawPart.partID,
@@ -368,7 +368,9 @@ async function doCompression(
                         ignored: false,
                         metadata: { compressed: true },
                     },
-                })
+                }
+                pendingPatches.push(drPatch)
+                lastPatch = drPatch
                 directReplacedCount++
                 compressedCount++
                 continue
@@ -393,7 +395,7 @@ async function doCompression(
             )
 
             // Queue the PATCH (will apply in batch after all parts processed)
-            pendingPatches.push({
+            const compressPatch = {
                 path: `/session/${sessionID}/message/${msgID}/part/${rawPart.partID}`,
                 body: {
                     id: rawPart.partID,
@@ -405,7 +407,9 @@ async function doCompression(
                     ignored: false,
                     metadata: { compressed: true },
                 },
-            })
+            }
+            pendingPatches.push(compressPatch)
+            lastPatch = compressPatch
             compressedCount++
         }
 
@@ -432,36 +436,26 @@ async function doCompression(
             }
         }
 
+        // Append boundary text to the last compressed part (no separate message needed)
+        // This naturally places it at the boundary between compressed history and current window.
+        // Using session.prompt() would always append at the end of the conversation, which is wrong.
+        if (lastPatch) {
+            const boundaryParts = rawParts.filter(p => !isDirectReplaceTool(p) && estimateRawPartTokens(p) >= MIN_COMPRESS_TOKENS).length
+            const boundaryText = [
+                `── Compression Boundary ──`,
+                `Processed ${compressedCount} part(s)` +
+                    (directReplacedCount > 0 ? ` (${directReplacedCount} tools replaced directly)` : "") +
+                    (skippedCount > 0 ? `, ${skippedCount} too short skipped` : ""),
+                `${boundaryParts} part(s) summarized by Compresser agent. Original data preserved in message history.`,
+            ].join("\n")
+
+            lastPatch.body.text = lastPatch.body.text + "\n\n" + boundaryText.trim()
+        }
+
         // Flush all queued patches atomically — single cache invalidation
         for (const p of pendingPatches) {
             await clientPATCH(cl, directory, p.path, p.body)
         }
-        // Create a boundary summary message in the user's session (no LLM, just record keeping)
-        // This marks "everything before this message is compressed history"
-        const boundaryParts = rawParts.filter(p => !isDirectReplaceTool(p) && estimateRawPartTokens(p) >= MIN_COMPRESS_TOKENS).length
-        const boundaryText = [
-            `── Compression Boundary ──`,
-            `Processed ${compressedCount} part(s)` +
-                (directReplacedCount > 0 ? ` (${directReplacedCount} tools replaced directly)` : "") +
-                (skippedCount > 0 ? `, ${skippedCount} too short skipped` : ""),
-            `${boundaryParts} part(s) summarized by Compresser agent. Original data preserved in message history.`,
-        ].join("\n")
-
-        const boundary = responseData(
-            await ctx.client.session.prompt({
-                path: { id: sessionID },
-                body: {
-                    noReply: true,
-                    parts: [{
-                        type: "text",
-                        text: boundaryText.trim(),
-                        metadata: { compressed: true, compressionBoundary: true },
-                    }],
-                },
-                query: { directory },
-            }),
-        )
-        boundaryMsgID = boundary?.info?.id ?? ""
     } finally {
         await ctx.client.session.delete({ path: { id: tempSessionID } })
     }
@@ -470,7 +464,6 @@ async function doCompression(
         compressedCount,
         directReplacedCount,
         skippedCount,
-        boundaryMsgID,
     }
 }
 
@@ -672,7 +665,7 @@ export const ContextCompressorPlugin: Plugin = async (ctx, options) => {
             let msg = `Compressor plugin processed ${result.compressedCount} part(s)`
             if (result.directReplacedCount > 0) msg += ` (${result.directReplacedCount} tools replaced directly)`
             if (result.skippedCount > 0) msg += `, ${result.skippedCount} too short skipped`
-            msg += ` for session: ${input.sessionID}. Boundary: ${result.boundaryMsgID}.`
+            msg += ` for session: ${input.sessionID}.`
             output.parts.push({ type: "text", text: msg })
         },
     }
